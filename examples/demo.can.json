@@ -1,0 +1,746 @@
+{
+    "format": "can-db",
+    "format_version": 1,
+    "name": "CAN DBZ Demo Fleet",
+    "description": "Two-bus sample database for the can_dbz_vis demo mode.",
+    "buses": [
+        {
+            "name": "powertrain",
+            "nominal_bitrate": 500000,
+            "protocol": "CAN",
+            "description": "Engine and drivetrain control traffic.",
+            "attributes": {
+                "BusRole": "Powertrain"
+            },
+            "dbc": {
+                "comment": "Primary propulsion network"
+            }
+        },
+        {
+            "name": "body",
+            "nominal_bitrate": 500000,
+            "data_bitrate": 2000000,
+            "protocol": "CAN FD",
+            "description": "Body electronics and battery telemetry.",
+            "attributes": {
+                "BusRole": "Body and energy"
+            },
+            "extensions": {
+                "demo": {
+                    "color": "cyan"
+                }
+            }
+        }
+    ],
+    "nodes": [
+        {
+            "name": "EngineECU",
+            "description": "Powertrain controller.",
+            "attributes": {
+                "NodeAddress": "0x10"
+            }
+        },
+        {
+            "name": "TransmissionECU",
+            "attributes": {
+                "NodeAddress": "0x20"
+            }
+        },
+        {
+            "name": "BodyController",
+            "attributes": {
+                "NodeAddress": "0x30"
+            }
+        },
+        {
+            "name": "Dashboard",
+            "attributes": {
+                "NodeAddress": "0x40"
+            }
+        },
+        {
+            "name": "BatteryMonitor",
+            "attributes": {
+                "NodeAddress": "0x50"
+            }
+        }
+    ],
+    "attributes": {
+        "Manufacturer": "CAN DBZ Example",
+        "DatasetRevision": "2"
+    },
+    "attribute_definitions": [
+        {
+            "name": "Manufacturer",
+            "scope": "document",
+            "type": "string",
+            "default": "CAN DBZ Example"
+        },
+        {
+            "name": "DatasetRevision",
+            "scope": "document",
+            "type": "integer",
+            "minimum": "1",
+            "maximum": "99",
+            "default": "2"
+        },
+        {
+            "name": "BusRole",
+            "scope": "bus",
+            "type": "string"
+        },
+        {
+            "name": "NodeAddress",
+            "scope": "node",
+            "type": "hex"
+        },
+        {
+            "name": "GenMsgCycleTime",
+            "scope": "message",
+            "type": "integer",
+            "minimum": "0",
+            "maximum": "65535",
+            "default": "100"
+        },
+        {
+            "name": "SignalGroup",
+            "scope": "signal",
+            "type": "string"
+        },
+        {
+            "name": "CalibrationClass",
+            "scope": "signal",
+            "type": "enum",
+            "labels": [
+                "standard",
+                "safety"
+            ],
+            "default": "0"
+        },
+        {
+            "name": "SampleSource",
+            "scope": "environment_variable",
+            "type": "string"
+        }
+    ],
+    "value_tables": [
+        {
+            "name": "EngineState",
+            "choices": [
+                {
+                    "raw": "0",
+                    "label": "Off"
+                },
+                {
+                    "raw": "1",
+                    "label": "Cranking"
+                },
+                {
+                    "raw": "2",
+                    "label": "Running"
+                },
+                {
+                    "raw": "3",
+                    "label": "Fault"
+                }
+            ]
+        },
+        {
+            "name": "GearSelection",
+            "choices": [
+                {
+                    "raw": "0",
+                    "label": "Park"
+                },
+                {
+                    "raw": "1",
+                    "label": "Reverse"
+                },
+                {
+                    "raw": "2",
+                    "label": "Neutral"
+                },
+                {
+                    "raw": "3",
+                    "label": "Drive"
+                },
+                {
+                    "raw": "4",
+                    "label": "Sport"
+                }
+            ]
+        },
+        {
+            "name": "SwitchState",
+            "choices": [
+                {
+                    "raw": "0",
+                    "label": "Inactive"
+                },
+                {
+                    "raw": "1",
+                    "label": "Active"
+                }
+            ]
+        },
+        {
+            "name": "DiagnosticSeverity",
+            "choices": [
+                {
+                    "raw": "0",
+                    "label": "Info"
+                },
+                {
+                    "raw": "1",
+                    "label": "Warning"
+                },
+                {
+                    "raw": "2",
+                    "label": "Error"
+                },
+                {
+                    "raw": "3",
+                    "label": "Critical"
+                }
+            ]
+        }
+    ],
+    "environment_variables": [
+        {
+            "name": "AmbientTemperature",
+            "type": "float",
+            "minimum": "-40",
+            "maximum": "85",
+            "unit": "degC",
+            "initial_value": "22.5",
+            "ev_id": 1,
+            "access_type": 0,
+            "access_nodes": [
+                "BodyController",
+                "Dashboard"
+            ],
+            "description": "Ambient temperature used by the body controller.",
+            "attributes": {
+                "SampleSource": "ambient sensor"
+            }
+        }
+    ],
+    "messages": [
+        {
+            "name": "EngineStatus",
+            "bus": "powertrain",
+            "id": "0x100",
+            "extended": false,
+            "frame": "classic",
+            "length": 8,
+            "description": "Engine speed, torque, and operating state.",
+            "transmitters": [
+                "EngineECU"
+            ],
+            "receivers": [
+                "Dashboard",
+                "TransmissionECU"
+            ],
+            "attributes": {
+                "GenMsgCycleTime": "20"
+            },
+            "signals": [
+                {
+                    "name": "EngineSpeed",
+                    "description": "Crankshaft speed.",
+                    "start_bit": 0,
+                    "bit_length": 16,
+                    "byte_order": "little_endian",
+                    "type": "unsigned",
+                    "factor": "0.125",
+                    "offset": "0",
+                    "minimum": "0",
+                    "maximum": "8191.875",
+                    "unit": "rpm",
+                    "receivers": [
+                        "Dashboard"
+                    ],
+                    "attributes": {
+                        "SignalGroup": "Engine"
+                    }
+                },
+                {
+                    "name": "EngineTorque",
+                    "start_bit": 16,
+                    "bit_length": 16,
+                    "byte_order": "little_endian",
+                    "type": "signed",
+                    "factor": "0.1",
+                    "offset": "0",
+                    "minimum": "-3276.8",
+                    "maximum": "3276.7",
+                    "unit": "Nm",
+                    "attributes": {
+                        "SignalGroup": "Engine",
+                        "CalibrationClass": "1"
+                    }
+                },
+                {
+                    "name": "EngineState",
+                    "start_bit": 32,
+                    "bit_length": 2,
+                    "byte_order": "little_endian",
+                    "type": "unsigned",
+                    "value_table": "EngineState"
+                },
+                {
+                    "name": "OilPressure",
+                    "start_bit": 40,
+                    "bit_length": 16,
+                    "byte_order": "big_endian",
+                    "type": "unsigned",
+                    "factor": "0.1",
+                    "offset": "0",
+                    "unit": "kPa"
+                }
+            ]
+        },
+        {
+            "name": "VehicleMode",
+            "bus": "powertrain",
+            "id": "0x101",
+            "extended": false,
+            "frame": "classic",
+            "length": 8,
+            "transmitters": [
+                "EngineECU"
+            ],
+            "receivers": [
+                "Dashboard"
+            ],
+            "attributes": {
+                "GenMsgCycleTime": "100"
+            },
+            "signals": [
+                {
+                    "name": "ModePage",
+                    "start_bit": 0,
+                    "bit_length": 2,
+                    "byte_order": "little_endian",
+                    "type": "unsigned",
+                    "is_multiplexer": true
+                },
+                {
+                    "name": "CruiseSetSpeed",
+                    "start_bit": 8,
+                    "bit_length": 16,
+                    "byte_order": "little_endian",
+                    "type": "unsigned",
+                    "factor": "0.1",
+                    "unit": "km/h",
+                    "when": [
+                        {
+                            "selector": "ModePage",
+                            "ranges": [
+                                [
+                                    "1",
+                                    "1"
+                                ]
+                            ]
+                        }
+                    ]
+                },
+                {
+                    "name": "RegenLevel",
+                    "start_bit": 24,
+                    "bit_length": 8,
+                    "byte_order": "little_endian",
+                    "type": "unsigned",
+                    "unit": "%",
+                    "when": [
+                        {
+                            "selector": "ModePage",
+                            "ranges": [
+                                [
+                                    "2",
+                                    "2"
+                                ]
+                            ]
+                        }
+                    ]
+                },
+                {
+                    "name": "TowMode",
+                    "start_bit": 32,
+                    "bit_length": 1,
+                    "byte_order": "little_endian",
+                    "type": "unsigned",
+                    "value_table": "SwitchState",
+                    "when": [
+                        {
+                            "selector": "ModePage",
+                            "ranges": [
+                                [
+                                    "3",
+                                    "3"
+                                ]
+                            ]
+                        }
+                    ]
+                }
+            ]
+        },
+        {
+            "name": "WheelSpeeds",
+            "bus": "powertrain",
+            "id": "0x180",
+            "extended": false,
+            "frame": "classic",
+            "length": 8,
+            "transmitters": [
+                "EngineECU"
+            ],
+            "signals": [
+                {
+                    "name": "FrontLeft",
+                    "start_bit": 0,
+                    "bit_length": 16,
+                    "byte_order": "little_endian",
+                    "type": "unsigned",
+                    "factor": "0.01",
+                    "unit": "km/h"
+                },
+                {
+                    "name": "FrontRight",
+                    "start_bit": 16,
+                    "bit_length": 16,
+                    "byte_order": "little_endian",
+                    "type": "unsigned",
+                    "factor": "0.01",
+                    "unit": "km/h"
+                },
+                {
+                    "name": "RearLeft",
+                    "start_bit": 32,
+                    "bit_length": 16,
+                    "byte_order": "little_endian",
+                    "type": "unsigned",
+                    "factor": "0.01",
+                    "unit": "km/h"
+                },
+                {
+                    "name": "RearRight",
+                    "start_bit": 48,
+                    "bit_length": 16,
+                    "byte_order": "little_endian",
+                    "type": "unsigned",
+                    "factor": "0.01",
+                    "unit": "km/h"
+                }
+            ]
+        },
+        {
+            "name": "TransmissionStatus",
+            "bus": "powertrain",
+            "id": "0x200",
+            "extended": false,
+            "frame": "classic",
+            "length": 8,
+            "transmitters": [
+                "TransmissionECU"
+            ],
+            "signals": [
+                {
+                    "name": "Gear",
+                    "start_bit": 0,
+                    "bit_length": 4,
+                    "byte_order": "little_endian",
+                    "type": "unsigned",
+                    "value_table": "GearSelection"
+                },
+                {
+                    "name": "ClutchTemperature",
+                    "start_bit": 8,
+                    "bit_length": 8,
+                    "byte_order": "little_endian",
+                    "type": "signed",
+                    "factor": "0.5",
+                    "offset": "-40",
+                    "unit": "degC"
+                }
+            ]
+        },
+        {
+            "name": "BodyLights",
+            "bus": "body",
+            "id": "0x300",
+            "extended": false,
+            "frame": "classic",
+            "length": 8,
+            "transmitters": [
+                "BodyController"
+            ],
+            "receivers": [
+                "Dashboard"
+            ],
+            "signals": [
+                {
+                    "name": "Headlights",
+                    "start_bit": 0,
+                    "bit_length": 1,
+                    "byte_order": "little_endian",
+                    "type": "unsigned",
+                    "value_table": "SwitchState"
+                },
+                {
+                    "name": "HighBeam",
+                    "start_bit": 1,
+                    "bit_length": 1,
+                    "byte_order": "little_endian",
+                    "type": "unsigned",
+                    "value_table": "SwitchState"
+                },
+                {
+                    "name": "LeftIndicator",
+                    "start_bit": 2,
+                    "bit_length": 1,
+                    "byte_order": "little_endian",
+                    "type": "unsigned",
+                    "value_table": "SwitchState"
+                },
+                {
+                    "name": "RightIndicator",
+                    "start_bit": 3,
+                    "bit_length": 1,
+                    "byte_order": "little_endian",
+                    "type": "unsigned",
+                    "value_table": "SwitchState"
+                }
+            ]
+        },
+        {
+            "name": "DoorStatus",
+            "bus": "body",
+            "id": "0x301",
+            "extended": false,
+            "frame": "classic",
+            "length": 8,
+            "transmitters": [
+                "BodyController"
+            ],
+            "signals": [
+                {
+                    "name": "DoorPage",
+                    "start_bit": 0,
+                    "bit_length": 2,
+                    "byte_order": "little_endian",
+                    "type": "unsigned",
+                    "is_multiplexer": true
+                },
+                {
+                    "name": "FrontLeftDoor",
+                    "start_bit": 8,
+                    "bit_length": 1,
+                    "byte_order": "little_endian",
+                    "type": "unsigned",
+                    "value_table": "SwitchState",
+                    "when": [
+                        {
+                            "selector": "DoorPage",
+                            "ranges": [
+                                [
+                                    "0",
+                                    "0"
+                                ]
+                            ]
+                        }
+                    ]
+                },
+                {
+                    "name": "FrontRightDoor",
+                    "start_bit": 9,
+                    "bit_length": 1,
+                    "byte_order": "little_endian",
+                    "type": "unsigned",
+                    "value_table": "SwitchState",
+                    "when": [
+                        {
+                            "selector": "DoorPage",
+                            "ranges": [
+                                [
+                                    "1",
+                                    "1"
+                                ]
+                            ]
+                        }
+                    ]
+                },
+                {
+                    "name": "RearLeftDoor",
+                    "start_bit": 10,
+                    "bit_length": 1,
+                    "byte_order": "little_endian",
+                    "type": "unsigned",
+                    "value_table": "SwitchState",
+                    "when": [
+                        {
+                            "selector": "DoorPage",
+                            "ranges": [
+                                [
+                                    "2",
+                                    "2"
+                                ]
+                            ]
+                        }
+                    ]
+                },
+                {
+                    "name": "RearRightDoor",
+                    "start_bit": 11,
+                    "bit_length": 1,
+                    "byte_order": "little_endian",
+                    "type": "unsigned",
+                    "value_table": "SwitchState",
+                    "when": [
+                        {
+                            "selector": "DoorPage",
+                            "ranges": [
+                                [
+                                    "3",
+                                    "3"
+                                ]
+                            ]
+                        }
+                    ]
+                }
+            ]
+        },
+        {
+            "name": "BatteryPackSummary",
+            "bus": "body",
+            "id": "0x18FF50E5",
+            "extended": true,
+            "frame": "fd",
+            "length": 64,
+            "description": "Battery state and thermal summary.",
+            "transmitters": [
+                "BatteryMonitor"
+            ],
+            "attributes": {
+                "GenMsgCycleTime": "100"
+            },
+            "signals": [
+                {
+                    "name": "PackVoltage",
+                    "start_bit": 0,
+                    "bit_length": 16,
+                    "byte_order": "little_endian",
+                    "type": "unsigned",
+                    "factor": "0.1",
+                    "maximum": "6553.5",
+                    "unit": "V"
+                },
+                {
+                    "name": "PackCurrent",
+                    "start_bit": 16,
+                    "bit_length": 16,
+                    "byte_order": "little_endian",
+                    "type": "signed",
+                    "factor": "0.1",
+                    "unit": "A"
+                },
+                {
+                    "name": "StateOfCharge",
+                    "start_bit": 32,
+                    "bit_length": 8,
+                    "byte_order": "little_endian",
+                    "type": "unsigned",
+                    "factor": "0.5",
+                    "unit": "%"
+                },
+                {
+                    "name": "ContactorState",
+                    "start_bit": 40,
+                    "bit_length": 2,
+                    "byte_order": "little_endian",
+                    "type": "unsigned",
+                    "value_table": "SwitchState"
+                }
+            ]
+        },
+        {
+            "name": "ThermalSnapshot",
+            "bus": "body",
+            "id": "0x18FF53E5",
+            "extended": true,
+            "frame": "fd",
+            "length": 32,
+            "transmitters": [
+                "BatteryMonitor"
+            ],
+            "signals": [
+                {
+                    "name": "Module0Temperature",
+                    "start_bit": 0,
+                    "bit_length": 16,
+                    "byte_order": "little_endian",
+                    "type": "signed",
+                    "factor": "0.1",
+                    "offset": "-273.1",
+                    "unit": "degC"
+                },
+                {
+                    "name": "Module1Temperature",
+                    "start_bit": 16,
+                    "bit_length": 16,
+                    "byte_order": "little_endian",
+                    "type": "signed",
+                    "factor": "0.1",
+                    "offset": "-273.1",
+                    "unit": "degC"
+                }
+            ]
+        },
+        {
+            "name": "DiagnosticStatus",
+            "bus": "body",
+            "id": "0x700",
+            "extended": false,
+            "frame": "classic",
+            "length": 8,
+            "transmitters": [
+                "BodyController"
+            ],
+            "signals": [
+                {
+                    "name": "Severity",
+                    "start_bit": 0,
+                    "bit_length": 2,
+                    "byte_order": "little_endian",
+                    "type": "unsigned",
+                    "value_table": "DiagnosticSeverity"
+                },
+                {
+                    "name": "FaultCode",
+                    "start_bit": 8,
+                    "bit_length": 16,
+                    "byte_order": "little_endian",
+                    "type": "unsigned",
+                    "unit": "code"
+                },
+                {
+                    "name": "OccurrenceCount",
+                    "start_bit": 24,
+                    "bit_length": 8,
+                    "byte_order": "little_endian",
+                    "type": "unsigned"
+                }
+            ]
+        }
+    ],
+    "dbc": {
+        "version": "1.0",
+        "notes": "Demonstrates a preserved DBC metadata namespace."
+    },
+    "extensions": {
+        "can_dbz_vis": {
+            "demo_profile": "two-bus-fleet",
+            "review_status": "sample"
+        }
+    }
+}

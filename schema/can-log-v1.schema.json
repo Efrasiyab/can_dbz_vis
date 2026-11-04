@@ -1,0 +1,326 @@
+{
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "$id": "https://example.invalid/can-dbz-vis/can-log-v1.schema.json",
+    "title": "can_dbz_vis JSON Lines log v1",
+    "oneOf": [
+        {
+            "$ref": "#/$defs/header"
+        },
+        {
+            "$ref": "#/$defs/frame"
+        },
+        {
+            "$ref": "#/$defs/error_frame"
+        },
+        {
+            "$ref": "#/$defs/event"
+        },
+        {
+            "$ref": "#/$defs/marker"
+        },
+        {
+            "$ref": "#/$defs/footer"
+        }
+    ],
+    "$defs": {
+        "header": {
+            "type": "object",
+            "required": [
+                "type",
+                "format",
+                "version",
+                "created_utc",
+                "tool",
+                "database",
+                "buses"
+            ],
+            "properties": {
+                "type": {
+                    "const": "header"
+                },
+                "format": {
+                    "const": "can_dbz_vis/log"
+                },
+                "version": {
+                    "const": 1
+                },
+                "created_utc": {
+                    "type": "string",
+                    "format": "date-time"
+                },
+                "tool": {
+                    "type": "string"
+                },
+                "database": {
+                    "oneOf": [
+                        {
+                            "type": "null"
+                        },
+                        {
+                            "type": "object",
+                            "required": [
+                                "file",
+                                "sha256"
+                            ],
+                            "properties": {
+                                "file": {
+                                    "type": "string"
+                                },
+                                "sha256": {
+                                    "type": "string",
+                                    "pattern": "^[0-9a-fA-F]{64}$"
+                                }
+                            },
+                            "additionalProperties": true
+                        }
+                    ]
+                },
+                "buses": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/$defs/bus"
+                    }
+                }
+            },
+            "additionalProperties": true
+        },
+        "bus": {
+            "type": "object",
+            "required": [
+                "index",
+                "name",
+                "backend",
+                "channel",
+                "fd",
+                "timestamps"
+            ],
+            "properties": {
+                "index": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 255
+                },
+                "name": {
+                    "type": "string"
+                },
+                "backend": {
+                    "type": "string"
+                },
+                "channel": {
+                    "type": "string"
+                },
+                "bitrate": {
+                    "type": "integer",
+                    "minimum": 1
+                },
+                "data_bitrate": {
+                    "type": "integer",
+                    "minimum": 1
+                },
+                "fd": {
+                    "type": "boolean"
+                },
+                "timestamps": {
+                    "enum": [
+                        "hardware",
+                        "software"
+                    ]
+                }
+            },
+            "additionalProperties": true
+        },
+        "frame": {
+            "type": "object",
+            "required": [
+                "type",
+                "t_ns",
+                "bus",
+                "dir",
+                "id",
+                "len",
+                "data"
+            ],
+            "properties": {
+                "type": {
+                    "const": "frame"
+                },
+                "t_ns": {
+                    "type": "integer",
+                    "minimum": 0
+                },
+                "bus": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 255
+                },
+                "dir": {
+                    "enum": [
+                        "rx",
+                        "tx"
+                    ]
+                },
+                "id": {
+                    "type": "string",
+                    "pattern": "^[0-9A-F]{1,8}$"
+                },
+                "ext": {
+                    "type": "boolean"
+                },
+                "fd": {
+                    "type": "boolean"
+                },
+                "brs": {
+                    "type": "boolean"
+                },
+                "esi": {
+                    "type": "boolean"
+                },
+                "rtr": {
+                    "type": "boolean"
+                },
+                "echo": {
+                    "type": "boolean"
+                },
+                "len": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 64
+                },
+                "data": {
+                    "type": "string",
+                    "pattern": "^(?:[0-9A-F]{2}){0,64}$"
+                },
+                "status": {
+                    "enum": [
+                        "ok",
+                        "queue_full",
+                        "bus_off",
+                        "error"
+                    ]
+                },
+                "error": {
+                    "type": "string"
+                }
+            },
+            "additionalProperties": true
+        },
+        "error_frame": {
+            "type": "object",
+            "required": [
+                "type",
+                "t_ns",
+                "bus",
+                "class",
+                "data"
+            ],
+            "properties": {
+                "type": {
+                    "const": "error_frame"
+                },
+                "t_ns": {
+                    "type": "integer",
+                    "minimum": 0
+                },
+                "bus": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 255
+                },
+                "class": {
+                    "type": "string"
+                },
+                "data": {
+                    "type": "string",
+                    "pattern": "^(?:[0-9A-F]{2}){0,64}$"
+                }
+            },
+            "additionalProperties": true
+        },
+        "event": {
+            "type": "object",
+            "required": [
+                "type",
+                "t_ns",
+                "event"
+            ],
+            "properties": {
+                "type": {
+                    "const": "event"
+                },
+                "t_ns": {
+                    "type": "integer",
+                    "minimum": 0
+                },
+                "bus": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 255
+                },
+                "event": {
+                    "type": "string"
+                },
+                "state": {
+                    "type": "string"
+                },
+                "dropped": {
+                    "type": "integer",
+                    "minimum": 0
+                }
+            },
+            "additionalProperties": true
+        },
+        "marker": {
+            "type": "object",
+            "required": [
+                "type",
+                "t_ns",
+                "text"
+            ],
+            "properties": {
+                "type": {
+                    "const": "marker"
+                },
+                "t_ns": {
+                    "type": "integer",
+                    "minimum": 0
+                },
+                "text": {
+                    "type": "string"
+                }
+            },
+            "additionalProperties": true
+        },
+        "footer": {
+            "type": "object",
+            "required": [
+                "type",
+                "t_ns",
+                "records",
+                "frames",
+                "dropped"
+            ],
+            "properties": {
+                "type": {
+                    "const": "footer"
+                },
+                "t_ns": {
+                    "type": "integer",
+                    "minimum": 0
+                },
+                "records": {
+                    "type": "integer",
+                    "minimum": 0
+                },
+                "frames": {
+                    "type": "integer",
+                    "minimum": 0
+                },
+                "dropped": {
+                    "type": "integer",
+                    "minimum": 0
+                }
+            },
+            "additionalProperties": true
+        }
+    }
+}

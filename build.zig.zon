@@ -1,0 +1,26 @@
+.{
+    .name = .can_dbz_vis,
+    .fingerprint = 0xb3b55070461158da,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.17.0",
+    .dependencies = .{
+        .can_dbz = .{
+            .url = "git+https://github.com/Efrasiyab/can_dbz#27209744c12999ca8f9ecccd7bcd81594cf72bf2",
+            .hash = "can_dbz-0.0.0-HlV0immJBQBjGns5Ckz7hkjTXj2HjKEBnABREU7VKuKM",
+        },
+        .zigzag = .{
+            .url = "git+https://github.com/Efrasiyab/zigzag#15db0f7e12dd6840307c3062c9c5c4fa851c79d0",
+            .hash = "zigzag-0.1.7-YXwYS8sjEwDBfyibZxgq4YMU-GRXD_qgtePvgGWZF3-g",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "docs",
+        "LICENSE",
+        "README.md",
+        "Containerfile",
+        ".devcontainer",
+    },
+}

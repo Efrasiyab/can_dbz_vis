@@ -1,0 +1,15 @@
+.zig-cache/
+zig-cache/
+zig-out/
+zig-pkg/
+
+
+# Local git dir (because `.git/` is mounted read-only here)
+.git-local/
+
+# OS/editor noise
+.DS_Store
+*.swp
+
+# Recorded CAN logs
+*.canlog.jsonl

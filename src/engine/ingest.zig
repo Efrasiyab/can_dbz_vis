@@ -161,6 +161,7 @@ pub const Ingestor = struct {
         const samples = self.plot_samples orelse return;
         const database = self.compiled_database orelse return;
         const selection = config.read();
+        if (!selection.sampling_enabled) return;
         for (0..selection.count) |slot| {
             const target = selection.targets[slot].?;
             if (frame.bus != target.bus_index or frame.id != target.id or frame.flags.extended != target.extended) continue;
@@ -316,9 +317,15 @@ test "ingest decodes only configured plot signals into the sample queue" {
     frame.data[1] = 0x27;
     try std.testing.expect(frame_queue.push(frame));
     try std.testing.expectEqual(@as(usize, 1), ingestor.step());
+    try std.testing.expect(samples.pop() == null);
+
+    plot_config.setSamplingEnabled(true);
+    frame.timestamp_ns = 5678;
+    try std.testing.expect(frame_queue.push(frame));
+    try std.testing.expectEqual(@as(usize, 1), ingestor.step());
     const sample = samples.pop().?;
     try std.testing.expectEqual(@as(u8, 0), sample.signal_slot);
-    try std.testing.expectEqual(@as(u64, 1234), sample.timestamp_ns);
+    try std.testing.expectEqual(@as(u64, 5678), sample.timestamp_ns);
     try std.testing.expectApproxEqAbs(@as(f64, 2500), sample.value, 1e-9);
 }
 

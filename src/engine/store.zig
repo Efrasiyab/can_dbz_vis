@@ -27,6 +27,7 @@ pub const MessageRow = struct {
     cycle_min_ns: u64 = 0,
     cycle_max_ns: u64 = 0,
     cycle_avg_ns: u64 = 0,
+    last_delta_ns: u64 = 0,
     cycle_sum_ns: u128 = 0,
     cycle_samples: u64 = 0,
     changed_bytes: u64 = 0,
@@ -67,6 +68,7 @@ pub fn MessageTable(comptime capacity: usize, comptime trace_capacity: usize) ty
             cycle_max_ns: u64 = 0,
             cycle_sum_ns: u128 = 0,
             cycle_samples: u64 = 0,
+            last_delta_ns: u64 = 0,
             changed_bytes: u64 = 0,
         };
 
@@ -94,6 +96,7 @@ pub fn MessageTable(comptime capacity: usize, comptime trace_capacity: usize) ty
                     if (frame.data[index] != entry.latest.data[index]) changed |= @as(u64, 1) << @intCast(index);
                 }
                 entry.changed_bytes = changed;
+                entry.last_delta_ns = frame.timestamp_ns -| entry.latest.timestamp_ns;
 
                 if (frame.timestamp_ns >= entry.latest.timestamp_ns) {
                     const cycle = frame.timestamp_ns - entry.latest.timestamp_ns;
@@ -138,6 +141,7 @@ pub fn MessageTable(comptime capacity: usize, comptime trace_capacity: usize) ty
                         0
                     else
                         @intCast(entry.cycle_sum_ns / entry.cycle_samples),
+                    .last_delta_ns = entry.last_delta_ns,
                     .cycle_sum_ns = entry.cycle_sum_ns,
                     .cycle_samples = entry.cycle_samples,
                     .changed_bytes = entry.changed_bytes,
@@ -163,6 +167,7 @@ pub fn MessageTable(comptime capacity: usize, comptime trace_capacity: usize) ty
                 entry.cycle_max_ns = row.cycle_max_ns;
                 entry.cycle_sum_ns = row.cycle_sum_ns;
                 entry.cycle_samples = row.cycle_samples;
+                entry.last_delta_ns = row.last_delta_ns;
                 entry.changed_bytes = row.changed_bytes;
             }
             const trace_count = @min(snapshot.trace_len, trace_capacity);
@@ -236,6 +241,7 @@ test "message table aggregates stats and publishes rows sorted by bus and ID" {
     try std.testing.expectEqual(@as(u64, 10), snapshot.rows[2].cycle_min_ns);
     try std.testing.expectEqual(@as(u64, 20), snapshot.rows[2].cycle_max_ns);
     try std.testing.expectEqual(@as(u64, 15), snapshot.rows[2].cycle_avg_ns);
+    try std.testing.expectEqual(@as(u64, 20), snapshot.rows[2].last_delta_ns);
     try std.testing.expectEqual(@as(u64, 0b11), snapshot.rows[2].changed_bytes);
     try std.testing.expectEqual(@as(u64, 5), snapshot.frames_total);
     try std.testing.expectEqual(@as(u64, 7), snapshot.generation);
@@ -270,6 +276,7 @@ test "message table snapshot restoration preserves cycle statistics" {
     try std.testing.expectEqual(@as(u64, 20), actual.rows[0].cycle_max_ns);
     try std.testing.expectEqual(@as(u128, 30), actual.rows[0].cycle_sum_ns);
     try std.testing.expectEqual(@as(u64, 2), actual.rows[0].cycle_samples);
+    try std.testing.expectEqual(@as(u64, 20), actual.rows[0].last_delta_ns);
 }
 
 test "keyframe row export restores messages beyond the visible snapshot limit" {

@@ -2,12 +2,15 @@ const std = @import("std");
 const spsc = @import("../sync/spsc.zig");
 const triple_buffer = @import("../sync/triple_buffer.zig");
 
-pub const max_signals = 8;
+pub const max_signals = 20;
 pub const history_capacity = 200_000;
 pub const max_chart_width = 256;
 pub const max_decimated_points = max_chart_width * 2;
 pub const sample_queue_capacity = 32_768;
 const sample_batch_capacity = 512;
+pub const default_window_ns = 10 * std.time.ns_per_s;
+pub const min_plot_window_ns = 100 * std.time.ns_per_us;
+pub const max_plot_window_ns = 600 * std.time.ns_per_s;
 
 pub const Target = struct {
     bus_index: u8,
@@ -15,6 +18,7 @@ pub const Target = struct {
     signal_index: usize,
     id: u32,
     extended: bool,
+    plot_index: u8 = 0,
 };
 
 pub const Selection = struct {
@@ -22,9 +26,11 @@ pub const Selection = struct {
     count: u8 = 0,
     generation: u64 = 0,
     view_generation: u64 = 0,
-    window_ns: u64 = 10 * std.time.ns_per_s,
+    window_ns: u64 = default_window_ns,
+    plot_windows_ns: [max_signals]u64 = @splat(default_window_ns),
     scroll_offset_ns: u64 = 0,
     chart_width: u16 = 80,
+    sampling_enabled: bool = false,
 };
 
 const AtomicTarget = struct {
@@ -33,15 +39,18 @@ const AtomicTarget = struct {
     signal_index: std.atomic.Value(usize) = .init(0),
     id: std.atomic.Value(u32) = .init(0),
     extended: std.atomic.Value(bool) = .init(false),
+    plot_index: std.atomic.Value(u8) = .init(0),
 };
 
 pub const Config = struct {
     version: std.atomic.Value(u64) = .init(0),
     view_version: std.atomic.Value(u64) = .init(0),
     count: std.atomic.Value(u8) = .init(0),
-    window_ns: std.atomic.Value(u64) = .init(10 * std.time.ns_per_s),
+    window_ns: std.atomic.Value(u64) = .init(default_window_ns),
+    plot_windows_ns: [max_signals]std.atomic.Value(u64) = @splat(.init(default_window_ns)),
     scroll_offset_ns: std.atomic.Value(u64) = .init(0),
     chart_width: std.atomic.Value(u16) = .init(80),
+    sampling_enabled: std.atomic.Value(bool) = .init(false),
     targets: [max_signals]AtomicTarget = @splat(.{}),
 
     pub fn setTargets(self: *Config, targets: []const Target) void {
@@ -54,13 +63,24 @@ pub const Config = struct {
             self.targets[index].signal_index.store(target.signal_index, .monotonic);
             self.targets[index].id.store(target.id, .monotonic);
             self.targets[index].extended.store(target.extended, .monotonic);
+            self.targets[index].plot_index.store(target.plot_index, .monotonic);
         }
         self.count.store(@intCast(count), .monotonic);
         _ = self.version.fetchAdd(1, .release);
     }
 
     pub fn setWindow(self: *Config, window_ns: u64) void {
-        self.window_ns.store(@max(window_ns, 100 * std.time.ns_per_ms), .release);
+        const clamped = std.math.clamp(window_ns, min_plot_window_ns, max_plot_window_ns);
+        self.window_ns.store(clamped, .release);
+        for (&self.plot_windows_ns) |*plot_window| plot_window.store(clamped, .monotonic);
+        _ = self.view_version.fetchAdd(1, .release);
+    }
+
+    pub fn setPlotWindow(self: *Config, plot_index: usize, window_ns: u64) void {
+        if (plot_index >= max_signals) return;
+        const clamped = std.math.clamp(window_ns, min_plot_window_ns, max_plot_window_ns);
+        if (self.plot_windows_ns[plot_index].load(.acquire) == clamped) return;
+        self.plot_windows_ns[plot_index].store(clamped, .release);
         _ = self.view_version.fetchAdd(1, .release);
     }
 
@@ -70,7 +90,15 @@ pub const Config = struct {
     }
 
     pub fn setChartWidth(self: *Config, width: u16) void {
-        self.chart_width.store(@min(@max(width, 1), max_chart_width), .release);
+        const next_width = @min(@max(width, 1), max_chart_width);
+        if (self.chart_width.load(.acquire) == next_width) return;
+        self.chart_width.store(next_width, .release);
+        _ = self.view_version.fetchAdd(1, .release);
+    }
+
+    pub fn setSamplingEnabled(self: *Config, enabled: bool) void {
+        if (self.sampling_enabled.load(.acquire) == enabled) return;
+        self.sampling_enabled.store(enabled, .release);
         _ = self.view_version.fetchAdd(1, .release);
     }
 
@@ -83,9 +111,12 @@ pub const Config = struct {
                 .generation = before,
                 .view_generation = self.view_version.load(.acquire),
                 .window_ns = self.window_ns.load(.acquire),
+                .plot_windows_ns = @splat(0),
                 .scroll_offset_ns = self.scroll_offset_ns.load(.acquire),
                 .chart_width = self.chart_width.load(.acquire),
+                .sampling_enabled = self.sampling_enabled.load(.acquire),
             };
+            for (0..max_signals) |index| selection.plot_windows_ns[index] = self.plot_windows_ns[index].load(.acquire);
             for (0..selection.count) |index| {
                 selection.targets[index] = .{
                     .bus_index = self.targets[index].bus_index.load(.monotonic),
@@ -93,6 +124,7 @@ pub const Config = struct {
                     .signal_index = self.targets[index].signal_index.load(.monotonic),
                     .id = self.targets[index].id.load(.monotonic),
                     .extended = self.targets[index].extended.load(.monotonic),
+                    .plot_index = self.targets[index].plot_index.load(.monotonic),
                 };
             }
             if (self.version.load(.acquire) == before) return selection;
@@ -216,8 +248,10 @@ pub const Worker = struct {
         } else {
             self.selection.view_generation = latest_selection.view_generation;
             self.selection.window_ns = latest_selection.window_ns;
+            self.selection.plot_windows_ns = latest_selection.plot_windows_ns;
             self.selection.scroll_offset_ns = latest_selection.scroll_offset_ns;
             self.selection.chart_width = latest_selection.chart_width;
+            self.selection.sampling_enabled = latest_selection.sampling_enabled;
         }
 
         var batch: [sample_batch_capacity]Sample = undefined;
@@ -246,13 +280,16 @@ pub const Worker = struct {
     }
 
     fn publish(self: *Worker, now_ns: u64) void {
-        var latest_ns = now_ns;
+        var latest_ns: u64 = 0;
+        var has_samples = false;
         for (0..self.selection.count) |slot| {
             const history = &self.histories[slot];
             if (history.len == 0) continue;
+            has_samples = true;
             const latest_index = (history.write_index -% 1) % history_capacity;
             latest_ns = @max(latest_ns, history.samples[latest_index].timestamp_ns);
         }
+        if (self.selection.sampling_enabled or !has_samples) latest_ns = @max(latest_ns, now_ns);
         const window_end_ns = latest_ns -| self.selection.scroll_offset_ns;
         const window_start_ns = window_end_ns -| self.selection.window_ns;
         var snapshot = Snapshot{
@@ -270,7 +307,10 @@ pub const Worker = struct {
             var series = &snapshot.series[slot];
             series.target = target;
             if (history.len == 0) continue;
-            decimate(history, series, window_start_ns, latest_ns, width);
+            const plot_window_ns = self.selection.plot_windows_ns[target.plot_index];
+            const plot_end_ns = latest_ns -| self.selection.scroll_offset_ns;
+            const plot_start_ns = plot_end_ns -| plot_window_ns;
+            decimate(history, series, plot_start_ns, plot_end_ns, width);
         }
         self.publish_generation +%= 1;
         self.snapshots.publish(snapshot);
@@ -345,13 +385,14 @@ fn appendDecimated(series: *Series, sample: Point, window_start_ns: u64) void {
 test "plot config publishes coherent signal selections" {
     var config: Config = .{};
     const targets = [_]Target{
-        .{ .bus_index = 2, .message_handle = 11, .signal_index = 3, .id = 0x123, .extended = false },
+        .{ .bus_index = 2, .message_handle = 11, .signal_index = 3, .id = 0x123, .extended = false, .plot_index = 2 },
     };
     config.setTargets(&targets);
     const selection = config.read();
     try std.testing.expectEqual(@as(u8, 1), selection.count);
     try std.testing.expectEqual(@as(u8, 2), selection.targets[0].?.bus_index);
     try std.testing.expectEqual(@as(usize, 11), selection.targets[0].?.message_handle);
+    try std.testing.expectEqual(@as(u8, 2), selection.targets[0].?.plot_index);
 }
 
 test "plot worker retains peaks with min/max pixel decimation" {
@@ -361,6 +402,7 @@ test "plot worker retains peaks with min/max pixel decimation" {
         .{ .bus_index = 0, .message_handle = 1, .signal_index = 0, .id = 1, .extended = false },
     };
     config.setTargets(&targets);
+    config.setSamplingEnabled(true);
     config.setChartWidth(2);
     const generation = config.read().generation;
     var queue: SampleQueue = .{};
@@ -385,6 +427,23 @@ test "plot worker retains peaks with min/max pixel decimation" {
     try std.testing.expect(updated.series[0].point_count != 0);
     try std.testing.expectEqual(@as(u64, 98), updated.window_end_ns);
 
+    config.setSamplingEnabled(true);
+    _ = worker.step(110);
+    config.setSamplingEnabled(false);
+    _ = worker.step(120);
+    const stopped = worker.readSnapshot();
+    config.setPlotWindow(0, 100 * std.time.ns_per_ms);
+    _ = worker.step(125);
+    const resized_while_stopped = worker.readSnapshot();
+    try std.testing.expectEqual(stopped.window_end_ns, resized_while_stopped.window_end_ns);
+    config.setChartWidth(2);
+    _ = worker.step(130);
+    const frozen = worker.readSnapshot();
+    try std.testing.expectEqual(stopped.window_end_ns, frozen.window_end_ns);
+    try std.testing.expectEqual(stopped.series[0].point_count, frozen.series[0].point_count);
+    try std.testing.expectEqual(stopped.series[0].maximum, frozen.series[0].maximum);
+    try std.testing.expectEqual(stopped.series[0].points[0].timestamp_ns, frozen.series[0].points[0].timestamp_ns);
+
     try std.testing.expect(queue.push(.{ .signal_slot = 0, .generation = generation, .timestamp_ns = 101, .value = 7 }));
     const reset = worker.requestReset();
     _ = worker.step(102);
@@ -394,7 +453,36 @@ test "plot worker retains peaks with min/max pixel decimation" {
     try std.testing.expectEqual(@as(?Sample, null), queue.pop());
 }
 
-test "plot worker handles eight 1 kHz series with bounded decimation" {
+test "plot worker decimates each chart with its own time window" {
+    const allocator = std.testing.allocator;
+    var config: Config = .{};
+    const targets = [_]Target{
+        .{ .bus_index = 0, .message_handle = 1, .signal_index = 0, .id = 1, .extended = false, .plot_index = 0 },
+        .{ .bus_index = 0, .message_handle = 2, .signal_index = 0, .id = 2, .extended = false, .plot_index = 1 },
+    };
+    config.setTargets(&targets);
+    config.setPlotWindow(0, 100 * std.time.ns_per_ms);
+    config.setPlotWindow(1, std.time.ns_per_s);
+    config.setChartWidth(4);
+    config.setSamplingEnabled(true);
+    const generation = config.read().generation;
+    var queue: SampleQueue = .{};
+    const worker = try Worker.create(allocator, std.testing.io, &config, &queue);
+    defer worker.stopAndDeinit();
+    for (0..2) |index| {
+        const timestamp: u64 = if (index == 0) 800 * std.time.ns_per_ms else std.time.ns_per_s;
+        try std.testing.expect(queue.push(.{ .signal_slot = 0, .generation = generation, .timestamp_ns = timestamp, .value = @floatFromInt(index) }));
+        try std.testing.expect(queue.push(.{ .signal_slot = 1, .generation = generation, .timestamp_ns = timestamp, .value = @floatFromInt(index) }));
+    }
+    _ = worker.step(std.time.ns_per_s);
+    const snapshot = worker.readSnapshot();
+    try std.testing.expectEqual(@as(u16, 1), snapshot.series[0].point_count);
+    try std.testing.expectEqual(@as(u16, 2), snapshot.series[1].point_count);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.1), snapshot.series[0].points[0].x, 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.8), snapshot.series[1].points[0].x, 1e-9);
+}
+
+test "plot worker handles twenty 1 kHz series with bounded decimation" {
     const allocator = std.testing.allocator;
     var config: Config = .{};
     var targets: [max_signals]Target = undefined;
@@ -404,6 +492,7 @@ test "plot worker handles eight 1 kHz series with bounded decimation" {
     config.setTargets(&targets);
     config.setWindow(std.time.ns_per_s);
     config.setChartWidth(80);
+    config.setSamplingEnabled(true);
     const generation = config.read().generation;
     var queue: SampleQueue = .{};
     const worker = try Worker.create(allocator, std.testing.io, &config, &queue);

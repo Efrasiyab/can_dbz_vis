@@ -20,9 +20,12 @@ pub const bus_off: StatusCode = 0x0000_0010;
 pub const device_not_found: StatusCode = 0x0000_0200;
 pub const hardware_in_use: StatusCode = 0x0000_0400;
 
-pub const channel_condition_parameter: u8 = 0x02;
+pub const channel_condition_parameter: u8 = 0x0D;
 pub const receive_event_parameter: u8 = 0x03;
 pub const listen_only_parameter: u8 = 0x08;
+pub const channel_features_parameter: u8 = 0x16;
+pub const feature_fd_capable: u32 = 0x01;
+pub const message_status: u8 = 0x80;
 pub const channel_available: u32 = 0x01;
 pub const channel_occupied: u32 = 0x02;
 
@@ -186,4 +189,18 @@ test "PCAN status mapping distinguishes queue, bus, and device states" {
     try std.testing.expectEqual(.passive, mapStatus(bus_heavy));
     try std.testing.expectEqual(.bus_off, mapStatus(bus_off));
     try std.testing.expectEqual(.disconnected, mapStatus(device_not_found));
+}
+
+test "PCAN channel enumeration uses the channel condition parameter" {
+    try std.testing.expectEqual(@as(u8, 0x0D), channel_condition_parameter);
+}
+
+test "PCAN channel feature flags identify FD-capable devices" {
+    try std.testing.expectEqual(@as(u8, 0x16), channel_features_parameter);
+    try std.testing.expectEqual(@as(u32, 0x01), feature_fd_capable);
+}
+
+test "PCAN status message flag is distinct from CAN frame flags" {
+    try std.testing.expectEqual(@as(u8, 0x80), message_status);
+    try std.testing.expect(message_status & 0x02 == 0);
 }

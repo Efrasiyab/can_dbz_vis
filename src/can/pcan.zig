@@ -44,14 +44,14 @@ const Channel = struct {
 };
 
 const channels = [_]Channel{
-    .{ .handle = 0x21, .prefix = "PCAN_PCIBUS", .index = 1 },
-    .{ .handle = 0x22, .prefix = "PCAN_PCIBUS", .index = 2 },
-    .{ .handle = 0x23, .prefix = "PCAN_PCIBUS", .index = 3 },
-    .{ .handle = 0x24, .prefix = "PCAN_PCIBUS", .index = 4 },
-    .{ .handle = 0x25, .prefix = "PCAN_PCIBUS", .index = 5 },
-    .{ .handle = 0x26, .prefix = "PCAN_PCIBUS", .index = 6 },
-    .{ .handle = 0x27, .prefix = "PCAN_PCIBUS", .index = 7 },
-    .{ .handle = 0x28, .prefix = "PCAN_PCIBUS", .index = 8 },
+    .{ .handle = 0x41, .prefix = "PCAN_PCIBUS", .index = 1 },
+    .{ .handle = 0x42, .prefix = "PCAN_PCIBUS", .index = 2 },
+    .{ .handle = 0x43, .prefix = "PCAN_PCIBUS", .index = 3 },
+    .{ .handle = 0x44, .prefix = "PCAN_PCIBUS", .index = 4 },
+    .{ .handle = 0x45, .prefix = "PCAN_PCIBUS", .index = 5 },
+    .{ .handle = 0x46, .prefix = "PCAN_PCIBUS", .index = 6 },
+    .{ .handle = 0x47, .prefix = "PCAN_PCIBUS", .index = 7 },
+    .{ .handle = 0x48, .prefix = "PCAN_PCIBUS", .index = 8 },
     .{ .handle = 0x51, .prefix = "PCAN_USBBUS", .index = 1 },
     .{ .handle = 0x52, .prefix = "PCAN_USBBUS", .index = 2 },
     .{ .handle = 0x53, .prefix = "PCAN_USBBUS", .index = 3 },
@@ -64,7 +64,7 @@ const channels = [_]Channel{
 
 pub const backend = adapter.Backend{
     .name = "peak",
-    .capabilities = .{ .fd = true, .hw_timestamps = false, .error_frames = true, .set_bitrate = true },
+    .capabilities = .{ .fd = false, .hw_timestamps = false, .error_frames = true, .set_bitrate = true },
     .enumerate = enumerate,
     .open = open,
 };
@@ -82,10 +82,13 @@ fn enumerate(allocator: std.mem.Allocator) adapter.Error![]adapter.ChannelInfo {
         var condition: u32 = 0;
         const status = api.get_value(channel.handle, api_mod.channel_condition_parameter, @ptrCast(&condition), @sizeOf(u32));
         if (status != api_mod.ok or condition & (api_mod.channel_available | api_mod.channel_occupied) == 0) continue;
+        var features: u32 = 0;
+        var capabilities = backend.capabilities;
+        capabilities.fd = api.get_value(channel.handle, api_mod.channel_features_parameter, @ptrCast(&features), @sizeOf(u32)) == api_mod.ok and features & api_mod.feature_fd_capable != 0;
         var name: [adapter.ChannelInfo.name_capacity]u8 = undefined;
         const channel_name = std.fmt.bufPrint(&name, "{s}{d}", .{ channel.prefix, channel.index }) catch return error.InvalidChannel;
         const description = if (condition & api_mod.channel_occupied != 0) "PEAK PCAN channel (in use)" else "PEAK PCAN channel";
-        try result.append(allocator, try adapter.ChannelInfo.init(backend.name, channel_name, description, backend.capabilities));
+        try result.append(allocator, try adapter.ChannelInfo.init(backend.name, channel_name, description, capabilities));
     }
     return result.toOwnedSlice(allocator) catch return error.OutOfMemory;
 }
@@ -163,9 +166,11 @@ fn classicBitrate(bitrate: u32) ?u16 {
 fn makeFdBitrate(output: *[160:0]u8, nominal: u32, data: u32) ?[*:0]const u8 {
     const nominal_timing = timing(nominal, 80) orelse return null;
     const data_timing = timing(data, 70) orelse return null;
-    const result = std.fmt.bufPrint(output[0..], "f_clock_mhz=80, nom_brp=1, nom_tseg1={d}, nom_tseg2={d}, nom_sjw=1, data_brp=1, data_tseg1={d}, data_tseg2={d}, data_sjw=1", .{
+    const result = std.fmt.bufPrint(output[0..], "f_clock_mhz=80, nom_brp={d}, nom_tseg1={d}, nom_tseg2={d}, nom_sjw=1, data_brp={d}, data_tseg1={d}, data_tseg2={d}, data_sjw=1", .{
+        nominal_timing.brp,
         nominal_timing.tseg1,
         nominal_timing.tseg2,
+        data_timing.brp,
         data_timing.tseg1,
         data_timing.tseg2,
     }) catch return null;
@@ -173,16 +178,21 @@ fn makeFdBitrate(output: *[160:0]u8, nominal: u32, data: u32) ?[*:0]const u8 {
     return output[0..result.len :0].ptr;
 }
 
-const Timing = struct { tseg1: u16, tseg2: u16 };
+const Timing = struct { brp: u16, tseg1: u16, tseg2: u16 };
 
 fn timing(bitrate: u32, sample_point_percent: u32) ?Timing {
-    if (bitrate == 0 or 80_000_000 % bitrate != 0) return null;
-    const quanta = 80_000_000 / bitrate;
-    if (quanta < 4 or quanta > 512) return null;
-    const tseg1: u32 = @max(1, quanta * sample_point_percent / 100 - 1);
-    const tseg2 = quanta - tseg1 - 1;
-    if (tseg2 == 0 or tseg1 > std.math.maxInt(u16) or tseg2 > std.math.maxInt(u16)) return null;
-    return .{ .tseg1 = @intCast(tseg1), .tseg2 = @intCast(tseg2) };
+    if (bitrate == 0) return null;
+    for (1..1025) |brp| {
+        const denominator = @as(u64, bitrate) * brp;
+        if (80_000_000 % denominator != 0) continue;
+        const quanta: u32 = @intCast(80_000_000 / denominator);
+        if (quanta < 4 or quanta > 512) continue;
+        const tseg1: u32 = @max(1, quanta * sample_point_percent / 100 - 1);
+        const tseg2 = quanta - tseg1 - 1;
+        if (tseg2 == 0 or tseg1 > std.math.maxInt(u16) or tseg2 > std.math.maxInt(u16)) continue;
+        return .{ .brp = @intCast(brp), .tseg1 = @intCast(tseg1), .tseg2 = @intCast(tseg2) };
+    }
+    return null;
 }
 
 fn read(ptr: *anyopaque, out: []Frame, timeout_ns: u64) adapter.Error!usize {
@@ -201,6 +211,7 @@ fn read(ptr: *anyopaque, out: []Frame, timeout_ns: u64) adapter.Error!usize {
             count += 1;
             continue;
         }
+        if (status == .skip) continue;
         if (status == .empty and count == 0 and timeout_ns != 0 and !waited) {
             waitForReceive(instance, timeout_ns);
             waited = true;
@@ -212,7 +223,11 @@ fn read(ptr: *anyopaque, out: []Frame, timeout_ns: u64) adapter.Error!usize {
     return count;
 }
 
-const ReadResult = union(enum) { frame, empty, err: adapter.Error };
+const ReadResult = union(enum) { frame, empty, skip, err: adapter.Error };
+
+fn isStatusMessage(message_type: u8) bool {
+    return message_type & api_mod.message_status != 0;
+}
 
 fn readOne(instance: *Pcan, out: *Frame) ReadResult {
     if (instance.fd) {
@@ -222,7 +237,10 @@ fn readOne(instance: *Pcan, out: *Frame) ReadResult {
         instance.status_code.store(status, .release);
         if (api_mod.mapStatus(status) == .empty) return .empty;
         if (status != api_mod.ok) return .{ .err = mapError(status) };
+        if (isStatusMessage(message.message_type)) return .skip;
         const length = dlcToLength(message.dlc) orelse return .{ .err = error.InvalidFrame };
+        const extended = message.message_type & fd_extended != 0;
+        if (message.id > (if (extended) @as(u32, 0x1fff_ffff) else @as(u32, 0x7ff))) return .{ .err = error.InvalidFrame };
         const timestamp = normalizeTimestamp(instance, driver_timestamp * std.time.ns_per_us);
         out.* = .{
             .timestamp_ns = timestamp,
@@ -230,7 +248,7 @@ fn readOne(instance: *Pcan, out: *Frame) ReadResult {
             .bus = 0,
             .len = length,
             .flags = .{
-                .extended = message.message_type & fd_extended != 0,
+                .extended = extended,
                 .fd = message.message_type & fd_flag != 0,
                 .brs = message.message_type & fd_brs != 0,
                 .esi = message.message_type & fd_esi != 0,
@@ -250,7 +268,10 @@ fn readOne(instance: *Pcan, out: *Frame) ReadResult {
     instance.status_code.store(status, .release);
     if (api_mod.mapStatus(status) == .empty) return .empty;
     if (status != api_mod.ok) return .{ .err = mapError(status) };
+    if (isStatusMessage(message.message_type)) return .skip;
     if (message.len > 8) return .{ .err = error.InvalidFrame };
+    const extended = message.message_type & classic_extended != 0;
+    if (message.id > (if (extended) @as(u32, 0x1fff_ffff) else @as(u32, 0x7ff))) return .{ .err = error.InvalidFrame };
     const driver_ns = (@as(u128, driver_timestamp.millis_overflow) << 32 | driver_timestamp.millis) * std.time.ns_per_ms + @as(u128, driver_timestamp.micros) * std.time.ns_per_us;
     const timestamp = normalizeTimestamp(instance, @intCast(@min(driver_ns, std.math.maxInt(u64))));
     out.* = .{
@@ -259,7 +280,7 @@ fn readOne(instance: *Pcan, out: *Frame) ReadResult {
         .bus = 0,
         .len = message.len,
         .flags = .{
-            .extended = message.message_type & classic_extended != 0,
+            .extended = extended,
             .fd = false,
             .brs = false,
             .esi = false,
@@ -402,15 +423,26 @@ fn waitForReceive(instance: *Pcan, timeout_ns: u64) void {
 
 test "PEAK channel parser and bitrate mappings are bounded" {
     try std.testing.expectEqual(@as(?api_mod.Handle, 0x51), parseChannel("PCAN_USBBUS1"));
-    try std.testing.expectEqual(@as(?api_mod.Handle, 0x28), parseChannel("PCAN_PCIBUS8"));
+    try std.testing.expectEqual(@as(?api_mod.Handle, 0x41), parseChannel("PCAN_PCIBUS1"));
+    try std.testing.expectEqual(@as(?api_mod.Handle, 0x48), parseChannel("PCAN_PCIBUS8"));
     try std.testing.expectEqual(@as(?api_mod.Handle, null), parseChannel("PCAN_USBBUS9"));
     try std.testing.expectEqual(@as(?u16, 0x001c), classicBitrate(500_000));
     try std.testing.expectEqual(@as(?u16, null), classicBitrate(333_333));
     try std.testing.expectEqual(@as(?u8, 9), lengthToDlc(12));
     try std.testing.expectEqual(@as(?u8, null), lengthToDlc(9));
     const nominal = timing(500_000, 80).?;
+    try std.testing.expectEqual(@as(u16, 1), nominal.brp);
     try std.testing.expectEqual(@as(u16, 127), nominal.tseg1);
     try std.testing.expectEqual(@as(u16, 32), nominal.tseg2);
+    try std.testing.expectEqual(@as(u16, 2), timing(125_000, 80).?.brp);
+    try std.testing.expectEqual(@as(u16, 2), timing(100_000, 80).?.brp);
     try std.testing.expectEqual(@as(usize, 20), @sizeOf(api_mod.Message));
     try std.testing.expectEqual(@as(usize, 72), @sizeOf(api_mod.MessageFd));
+}
+
+test "PEAK status reports are not exposed as CAN frames" {
+    try std.testing.expect(isStatusMessage(api_mod.message_status));
+    try std.testing.expect(isStatusMessage(api_mod.message_status | classic_extended));
+    try std.testing.expect(!isStatusMessage(classic_extended));
+    try std.testing.expect(!isStatusMessage(fd_flag | fd_extended));
 }

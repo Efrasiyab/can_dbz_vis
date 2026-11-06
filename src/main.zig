@@ -294,7 +294,7 @@ pub fn main(init: std.process.Init) !void {
     }, .{
         .fps = settings.fps,
         .title = "can_dbz_vis",
-        .mouse = replay_source != null,
+        .mouse = true,
     });
     program.model.program_options = &program.options;
     defer program.deinit();

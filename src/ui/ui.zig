@@ -39,8 +39,11 @@ pub const App = struct {
     pins: config.PinSet = .{},
     monitor: monitor.State = .{},
     pinned_selected: usize = 0,
+    pinned_scroll: usize = 0,
+    pinned_horizontal_scroll: usize = 0,
     transmit: transmit.State = .{},
     plot: plot_ui.State = .{},
+    pin_picker: plot_ui.State = .{},
     plot_config: engine_plot.Config = .{},
     plot_samples: engine_plot.SampleQueue = .{},
     plot_worker: ?*engine_plot.Worker = null,
@@ -53,6 +56,9 @@ pub const App = struct {
     pins_loaded: bool = false,
     pins_dirty: bool = false,
     last_pin_change_ns: u64 = 0,
+    plots_loaded: bool = false,
+    plots_dirty: bool = false,
+    last_plot_change_ns: u64 = 0,
     settings_dirty: bool = false,
     last_settings_change_ns: u64 = 0,
     notice: []const u8 = "",
@@ -68,7 +74,11 @@ pub const App = struct {
     pub fn init(self: *App, _: *zz.Context) !Cmd {
         self.transmit.ensureMessage(self.database);
         self.plot.window_seconds = self.settings.plot_window_seconds;
-        self.plot_config.setWindow(@as(u64, self.plot.window_seconds) * std.time.ns_per_s);
+        const default_window_ns = @as(u64, self.plot.window_seconds) * std.time.ns_per_s;
+        self.plot.plot_windows_ns = @splat(default_window_ns);
+        self.plot_config.setWindow(default_window_ns);
+        self.plot.running = false;
+        self.plot_config.setSamplingEnabled(false);
         self.engine.attachPlot(&self.plot_config, &self.plot_samples, &self.database.compiled);
         self.plot_worker = try engine_plot.Worker.create(self.allocator, self.io, &self.plot_config, &self.plot_samples);
         self.plot_worker.?.start() catch |err| {
@@ -82,6 +92,23 @@ pub const App = struct {
             return Cmd.everyMs(33);
         };
         self.pins_loaded = true;
+        const saved_plots = config.loadPlots(self.allocator, self.io, self.config_directory, &self.database_hash, self.database) catch |err| {
+            self.notice = @errorName(err);
+            return Cmd.everyMs(33);
+        };
+        self.plot.plot_count = saved_plots.plot_count;
+        self.plot.plot_windows_ns = saved_plots.plot_windows_ns;
+        self.plot.columns_override = saved_plots.columns_override;
+        for (0..saved_plots.plot_count) |plot_index| self.plot_config.setPlotWindow(plot_index, saved_plots.plot_windows_ns[plot_index]);
+        for (saved_plots.items[0..saved_plots.len]) |maybe_plot| {
+            const saved = maybe_plot.?;
+            self.plot.selected_message = saved.message;
+            self.plot.selected_signal = saved.signal;
+            self.plot.addSelectedToPlot(self.database, &self.plot_config, saved.plot_index);
+        }
+        self.plot.notice = "";
+        self.plot.publishConfig(&self.plot_config);
+        self.plots_loaded = true;
         if (self.log_path) |path| self.startRecording(path);
         if (self.replay_source) |replay| replay.play();
         return Cmd.everyMs(33);
@@ -91,6 +118,7 @@ pub const App = struct {
         switch (message) {
             .tick => {
                 if (self.pins_dirty and ctx.elapsed -| self.last_pin_change_ns >= std.time.ns_per_s) self.persistPins();
+                if (self.plots_dirty and ctx.elapsed -| self.last_plot_change_ns >= std.time.ns_per_s) self.persistPlots();
                 if (self.settings_dirty and ctx.elapsed -| self.last_settings_change_ns >= std.time.ns_per_s) self.persistSettings();
                 self.plot_config.setChartWidth(ctx.width -| 20);
             },
@@ -107,7 +135,13 @@ pub const App = struct {
         const writer = &output.writer;
         const database_name = self.database.doc.name orelse "CAN database";
         try writeStyled(writer, ctx.allocator, "can_dbz_vis", (zz.Style{}).fg(zz.Color.brightCyan).bold(true).inline_style(true));
-        try writer.print("  {s}\n", .{database_name});
+        try writeStyled(writer, ctx.allocator, "  ", (zz.Style{}).inline_style(true));
+        try writeStyled(writer, ctx.allocator, self.database_file, (zz.Style{}).fg(zz.Color.brightWhite).bold(true).inline_style(true));
+        if (!std.mem.eql(u8, self.database_file, database_name)) {
+            try writeStyled(writer, ctx.allocator, "  |  ", (zz.Style{}).fg(zz.Color.gray(13)).inline_style(true));
+            try writeStyled(writer, ctx.allocator, database_name, (zz.Style{}).fg(zz.Color.gray(15)).inline_style(true));
+        }
+        try writer.writeByte('\n');
         try self.renderTabBar(writer, ctx.allocator, ctx.width);
         try self.renderTabDescription(writer, ctx.allocator);
         if (self.replay_source) |replay| {
@@ -121,35 +155,6 @@ pub const App = struct {
             try writeStyled(writer, ctx.allocator, self.notice, (zz.Style{}).fg(zz.Color.brightYellow).inline_style(true));
             try writer.writeByte('\n');
         }
-        const live_snapshot = self.engine.readSnapshot();
-        const snapshot = if (self.paused) &self.frozen_snapshot else &live_snapshot;
-        const live_plot_snapshot = self.plot_worker.?.readSnapshot();
-        const plot_snapshot = if (self.paused) &self.frozen_plot_snapshot else &live_plot_snapshot;
-        switch (self.overlay) {
-            .help => try self.renderHelp(writer),
-            .connect => try self.renderConnect(writer),
-            .none => switch (self.active_tab) {
-                .monitor => try monitor.render(ctx.allocator, writer, ctx.width, ctx.height, self.database, snapshot, &self.monitor),
-                .transmit => if (self.replay_source != null or self.demo_source != null)
-                    try writer.writeAll(if (self.replay_source != null) "Transmit is disabled in replay mode\n" else "Transmit is disabled in demo mode\n")
-                else
-                    try transmit.render(writer, self.database, &self.transmit, self.engine.started, self.engine.activeTxJobs()),
-                .sent => try self.renderSent(ctx.allocator, writer, snapshot),
-                .plot => try plot_ui.render(ctx.allocator, writer, ctx.width, ctx.height, self.database, &self.plot, plot_snapshot),
-                .pinned => {
-                    try writeStyled(writer, ctx.allocator, "Pinned messages and signals", (zz.Style{}).fg(zz.Color.brightGreen).bold(true).inline_style(true));
-                    try writeStyled(writer, ctx.allocator, "  ↑/↓ select  p unpin", (zz.Style{}).fg(zz.Color.gray(14)).inline_style(true));
-                    try writer.writeByte('\n');
-                    if (self.pins.len == 0) {
-                        try writeStyled(writer, ctx.allocator, "No pinned signals yet. Press p on a selected message or signal.", (zz.Style{}).fg(zz.Color.gray(15)).inline_style(true));
-                        try writer.writeByte('\n');
-                    } else {
-                        try monitor.renderPins(ctx.allocator, writer, self.database, snapshot, &self.pins, self.pinned_selected);
-                    }
-                },
-            },
-        }
-        try self.renderFooter(writer, ctx.allocator);
         if (self.replay_source) |replay| {
             const progress = replay.indexProgress();
             if (replay.indexData()) |index| {
@@ -180,6 +185,49 @@ pub const App = struct {
                 }
             }
         }
+        const view_start = writer.buffered().len;
+        const prefix_rows = countLines(writer.buffered());
+        const view_height = @max(@as(usize, 1), @as(usize, ctx.height) -| prefix_rows -| 3);
+        const live_snapshot = self.engine.readSnapshot();
+        const snapshot = if (self.paused) &self.frozen_snapshot else &live_snapshot;
+        const live_plot_snapshot = self.plot_worker.?.readSnapshot();
+        const plot_snapshot = if (self.paused) &self.frozen_plot_snapshot else &live_plot_snapshot;
+        switch (self.overlay) {
+            .help => try self.renderHelp(writer),
+            .connect => try self.renderConnect(writer),
+            .none => switch (self.active_tab) {
+                .monitor => try monitor.render(ctx.allocator, writer, ctx.width, @intCast(view_height), self.database, snapshot, &self.monitor, &self.pins),
+                .transmit => if (self.replay_source != null or self.demo_source != null)
+                    try writer.writeAll(if (self.replay_source != null) "Transmit is disabled in replay mode\n" else "Transmit is disabled in demo mode\n")
+                else
+                    try transmit.render(writer, self.database, &self.transmit, self.engine.started, self.engine.activeTxJobs()),
+                .sent => try self.renderSent(ctx.allocator, writer, snapshot),
+                .plot => if (self.plot.window_edit_active)
+                    try plot_ui.render(ctx.allocator, writer, ctx.width, @intCast(view_height), self.database, &self.plot, plot_snapshot)
+                else if (self.plot.picker_open)
+                    try plot_ui.renderPicker(ctx.allocator, writer, ctx.width, @intCast(view_height), self.database, &self.plot, .plot, null)
+                else
+                    try plot_ui.render(ctx.allocator, writer, ctx.width, @intCast(view_height), self.database, &self.plot, plot_snapshot),
+                .pinned => if (self.pin_picker.picker_open) {
+                    try plot_ui.renderPicker(ctx.allocator, writer, ctx.width, @intCast(view_height), self.database, &self.pin_picker, .pins, &self.pins);
+                } else {
+                    try writeStyled(writer, ctx.allocator, "Pinned messages and signals", (zz.Style{}).fg(zz.Color.brightGreen).bold(true).inline_style(true));
+                    try writeStyled(writer, ctx.allocator, "  ↑/↓ select  PgUp/PgDn scroll  ←/→ value  p signals  x unpin", (zz.Style{}).fg(zz.Color.gray(14)).inline_style(true));
+                    try writer.writeByte('\n');
+                    if (self.pins.len == 0) {
+                        try writeStyled(writer, ctx.allocator, "No pinned signals yet. Press p on a selected message or signal.", (zz.Style{}).fg(zz.Color.gray(15)).inline_style(true));
+                        try writer.writeByte('\n');
+                    } else {
+                        try monitor.renderPins(ctx.allocator, writer, ctx.width, self.database, snapshot, &self.pins, self.pinned_selected, self.pinned_scroll, view_height -| 3, self.pinned_horizontal_scroll);
+                    }
+                },
+            },
+        }
+        const view_rows = countLines(writer.buffered()[view_start..]);
+        if (view_rows < view_height) {
+            for (view_rows..view_height) |_| try writer.writeByte('\n');
+        }
+        try self.renderFooter(writer, ctx.allocator);
         return writer.buffered();
     }
 
@@ -232,14 +280,23 @@ pub const App = struct {
             if (self.engine.isLogging()) "  |  REC" else "",
         });
         const hints = switch (self.active_tab) {
-            .monitor => "↑↓ select | → details | p pin | / filter | c connect | L log | m marker",
+            .monitor => "↑↓ move | → signals | b bus | p pin | / filter | c connect | L log | m mark",
             .transmit => "Arrows select | +/- value | Enter send | m periodic | s start | x stop",
             .sent => "Driver accepted does not mean bus ACK; inspect a bus capture",
-            .plot => "Arrows select | p add | x remove | +/- window | PgUp/PgDn scroll",
-            .pinned => "↑↓ select pin | p unpin | 1-4 other tabs",
+            .plot => if (self.plot.layout_edit_active) "Type columns (0=Auto) | Enter apply | Esc cancel" else if (self.plot.window_edit_active) "Type milliseconds | Enter apply | Esc cancel" else if (self.plot.assignment_signal != null) "←/→ choose plot | Enter assign | Esc cancel" else if (self.plot.picker_open) "↑↓ move | ←→ fold | Tab choose plot | Enter close" else "l layout | [/] chart | w window | i inspect/click | s start/stop | p signals | x remove",
+            .pinned => if (self.pin_picker.picker_open) "↑↓ move | ←→ fold | Tab pin/unpin | Enter close" else "↑↓ select | PgUp/PgDn scroll | ←→ value | p signals | x unpin",
         };
         try writeStyled(writer, allocator, hints, (zz.Style{}).fg(zz.Color.color256(110)).inline_style(true));
         try writer.writeByte('\n');
+    }
+
+    fn countLines(text: []const u8) usize {
+        var count: usize = 0;
+        for (text) |character| {
+            if (character == '\n') count += 1;
+        }
+        if (text.len != 0 and text[text.len - 1] != '\n') count += 1;
+        return count;
     }
 
     pub fn deinit(self: *App) void {
@@ -252,8 +309,11 @@ pub const App = struct {
             self.plot_worker = null;
         }
         if (self.pins_loaded or self.pins_dirty) self.persistPins();
+        if (self.plots_loaded or self.plots_dirty) self.persistPlots();
         if (self.settings_dirty) self.persistSettings();
         if (self.default_log_path) |path| self.allocator.free(path);
+        self.plot.deinit(self.allocator);
+        self.pin_picker.deinit(self.allocator);
     }
 
     fn handleKey(self: *App, event: zz.KeyEvent, ctx: *zz.Context) bool {
@@ -335,7 +395,7 @@ pub const App = struct {
             .quit => return true,
             .help => self.overlay = .help,
             .connect => {
-                self.connect.open(ctx.allocator);
+                self.connect.open(ctx.allocator, self.database.doc.buses.items, self.database.doc.messages.items);
                 self.overlay = .connect;
             },
             .pause => {
@@ -354,6 +414,7 @@ pub const App = struct {
                 self.monitor.selected_row = 0;
             },
             .database_only => self.monitor.database_only = !self.monitor.database_only,
+            .toggle_bus => self.toggleMonitorBus(),
             .next_tab => self.active_tab = @fromBackingInt(@intCast((@backingInt(self.active_tab) + 1) % 5)),
             .tab_monitor => self.active_tab = .monitor,
             .tab_transmit => self.active_tab = .transmit,
@@ -372,6 +433,19 @@ pub const App = struct {
     }
 
     fn handleMouse(self: *App, event: zz.MouseEvent, ctx: *zz.Context) void {
+        if (self.overlay == .none and self.active_tab == .plot and !self.plot.picker_open and !self.plot.window_edit_active and self.plot.inspect_enabled and event.event_type == .press and event.button == .left) {
+            const prefix_rows = self.viewPrefixRows();
+            const view_height = @max(@as(usize, ctx.height) -| prefix_rows -| 3, 1);
+            const heading_rows = plot_ui.headingRowCount(self.database, &self.plot);
+            const live_snapshot = self.plot_worker.?.readSnapshot();
+            const snapshot = if (self.paused) &self.frozen_plot_snapshot else &live_snapshot;
+            const grid_top = prefix_rows + heading_rows;
+            if (@as(usize, event.y) >= grid_top) {
+                const grid_y = @as(usize, event.y) - grid_top;
+                const grid_height = plot_ui.gridHeight(@intCast(view_height), self.database, &self.plot, snapshot);
+                if (self.plot.captureClick(event.x, @intCast(grid_y), ctx.width, grid_height, snapshot)) return;
+            }
+        }
         const replay = self.replay_source orelse return;
         if (self.overlay != .none) return;
         if (event.event_type != .press or event.button != .left or event.y != 4) return;
@@ -381,12 +455,109 @@ pub const App = struct {
         }
     }
 
+    fn viewPrefixRows(self: *const App) usize {
+        var rows: usize = 4;
+        if (self.replay_source != null) rows += 1;
+        if (self.notice.len != 0) rows += 1;
+        if (self.replay_source != null) rows += 1;
+        if (self.replay_source == null and self.demo_source == null) {
+            for (self.database.doc.buses.items, 0..) |_, index| {
+                const status = self.engine.channelStatus(@intCast(index)) orelse continue;
+                switch (status) {
+                    .bus_off, .disconnected => rows += 1,
+                    else => {},
+                }
+            }
+        }
+        return rows;
+    }
+
     fn handlePlotKey(self: *App, event: zz.KeyEvent, ctx: *zz.Context) bool {
+        if (self.plot.picker_open) {
+            if (self.plot.assignment_signal != null) {
+                switch (event.key) {
+                    .left => self.plot.moveAssignment(-1),
+                    .right => self.plot.moveAssignment(1),
+                    .enter, .tab => {
+                        const previous_count = self.plot.target_count;
+                        self.plot.confirmAssignment(self.database, &self.plot_config);
+                        if (self.plot.target_count != previous_count) {
+                            self.plots_dirty = true;
+                            self.last_plot_change_ns = ctx.elapsed;
+                        }
+                    },
+                    .escape => self.plot.assignment_signal = null,
+                    else => {},
+                }
+                return false;
+            }
+            switch (event.key) {
+                .up => self.plot.movePicker(self.database, -1),
+                .down => self.plot.movePicker(self.database, 1),
+                .left => self.plot.collapsePickerRow(self.database),
+                .right => self.plot.expandPickerRow(self.database),
+                .tab => {
+                    const previous_count = self.plot.target_count;
+                    self.plot.togglePickerSignal(self.database, &self.plot_config);
+                    if (self.plot.target_count != previous_count) {
+                        self.plots_dirty = true;
+                        self.last_plot_change_ns = ctx.elapsed;
+                    }
+                },
+                .enter, .escape => self.plot.picker_open = false,
+                .char => |character| switch (character) {
+                    'q' => return true,
+                    '1' => self.active_tab = .monitor,
+                    '2' => self.active_tab = .transmit,
+                    '3' => self.active_tab = .sent,
+                    '5' => self.active_tab = .pinned,
+                    else => {},
+                },
+                else => {},
+            }
+            return false;
+        }
+        if (self.plot.layout_edit_active) {
+            switch (event.key) {
+                .char => |character| if (character <= 0x7f and std.ascii.isDigit(@intCast(character))) self.plot.appendLayoutCharacter(@intCast(character)),
+                .backspace => self.plot.backspaceLayoutInput(),
+                .enter => {
+                    if (self.plot.commitLayoutEdit(self.plot.plot_count)) {
+                        self.plots_dirty = true;
+                        self.last_plot_change_ns = ctx.elapsed;
+                    } else {
+                        self.plot.notice = "Columns must be 0 (Auto) or between 1 and the plot count";
+                    }
+                },
+                .escape => self.plot.layout_edit_active = false,
+                else => {},
+            }
+            return false;
+        }
+        if (self.plot.window_edit_active) {
+            switch (event.key) {
+                .char => |character| {
+                    if ((character >= '0' and character <= '9') or character == '.') self.plot.appendWindowCharacter(@intCast(character));
+                },
+                .backspace => self.plot.backspaceWindowInput(),
+                .enter => {
+                    if (self.plot.commitWindowEdit(&self.plot_config)) {
+                        self.plots_dirty = true;
+                        self.last_plot_change_ns = ctx.elapsed;
+                    } else {
+                        self.plot.notice = "Enter a window from 0.1 to 600000 ms";
+                    }
+                },
+                .escape => self.plot.window_edit_active = false,
+                else => {},
+            }
+            return false;
+        }
         switch (keymap.resolve(event)) {
             .quit => return true,
             .help => self.overlay = .help,
             .connect => {
-                self.connect.open(ctx.allocator);
+                self.connect.open(ctx.allocator, self.database.doc.buses.items, self.database.doc.messages.items);
                 self.overlay = .connect;
             },
             .tab_monitor => self.active_tab = .monitor,
@@ -405,6 +576,9 @@ pub const App = struct {
                     self.paused = true;
                 }
             },
+            .pin => self.plot.openPicker(self.allocator, self.database) catch {
+                self.plot.notice = "Unable to open signal picker";
+            },
             .up => self.plot.moveSignal(self.database, -1),
             .down => self.plot.moveSignal(self.database, 1),
             .left => self.plot.moveMessage(self.database, -1),
@@ -413,8 +587,25 @@ pub const App = struct {
                 .page_up => self.plot.adjustScroll(&self.plot_config, 5),
                 .page_down => self.plot.adjustScroll(&self.plot_config, -5),
                 .char => |character| switch (character) {
-                    'p', '<' => self.plot.addSelected(self.database, &self.plot_config),
-                    'x' => self.plot.removeSelected(&self.plot_config),
+                    'l' => self.plot.beginLayoutEdit(),
+                    'i' => self.plot.toggleInspect(),
+                    'w' => self.plot.beginWindowEdit(),
+                    '[' => self.plot.selectPlot(-1),
+                    ']' => self.plot.selectPlot(1),
+                    's' => {
+                        self.plot.running = !self.plot.running;
+                        self.plot_config.setSamplingEnabled(self.plot.running);
+                    },
+                    '<' => {
+                        self.plot.addSelected(self.database, &self.plot_config);
+                        self.plots_dirty = true;
+                        self.last_plot_change_ns = ctx.elapsed;
+                    },
+                    'x' => {
+                        self.plot.removeSelected(&self.plot_config);
+                        self.plots_dirty = true;
+                        self.last_plot_change_ns = ctx.elapsed;
+                    },
                     '+', '=' => self.adjustPlotWindow(5, ctx.elapsed),
                     '-' => self.adjustPlotWindow(-5, ctx.elapsed),
                     else => {},
@@ -429,10 +620,32 @@ pub const App = struct {
         self.plot.adjustWindow(&self.plot_config, delta_seconds);
         self.settings.plot_window_seconds = self.plot.window_seconds;
         self.settings_dirty = true;
+        self.plots_dirty = true;
+        self.last_plot_change_ns = now_ns;
         self.last_settings_change_ns = now_ns;
     }
 
     fn handlePinnedKey(self: *App, event: zz.KeyEvent, ctx: *zz.Context) bool {
+        if (self.pin_picker.picker_open) {
+            switch (event.key) {
+                .up => self.pin_picker.movePicker(self.database, -1),
+                .down => self.pin_picker.movePicker(self.database, 1),
+                .left => self.pin_picker.collapsePickerRow(self.database),
+                .right => self.pin_picker.expandPickerRow(self.database),
+                .tab => self.togglePickerPin(ctx.elapsed),
+                .enter, .escape => self.pin_picker.picker_open = false,
+                .char => |character| switch (character) {
+                    'q' => return true,
+                    '1' => self.active_tab = .monitor,
+                    '2' => self.active_tab = .transmit,
+                    '3' => self.active_tab = .sent,
+                    '4' => self.active_tab = .plot,
+                    else => {},
+                },
+                else => {},
+            }
+            return false;
+        }
         switch (keymap.resolve(event)) {
             .quit => return true,
             .help => self.overlay = .help,
@@ -447,16 +660,25 @@ pub const App = struct {
             .down => {
                 if (self.pinned_selected + 1 < self.pins.len) self.pinned_selected += 1;
             },
-            .pin => self.unpinSelected(),
+            .pin => self.pin_picker.openPicker(self.allocator, self.database) catch {
+                self.notice = "Unable to open signal picker";
+            },
             .connect => {
                 if (self.demo_source != null) {
                     self.notice = "Connect is disabled in demo mode";
                 } else {
-                    self.connect.open(ctx.allocator);
+                    self.connect.open(ctx.allocator, self.database.doc.buses.items, self.database.doc.messages.items);
                     self.overlay = .connect;
                 }
             },
-            else => {},
+            else => switch (event.key) {
+                .page_up => self.scrollPinnedPins(ctx.height, -1),
+                .page_down => self.scrollPinnedPins(ctx.height, 1),
+                .left => self.pinned_horizontal_scroll -|= 8,
+                .right => self.pinned_horizontal_scroll +|= 8,
+                .char => |character| if (character == 'x') self.unpinSelected(),
+                else => {},
+            },
         }
         return false;
     }
@@ -469,6 +691,29 @@ pub const App = struct {
         self.pins_dirty = true;
         self.last_pin_change_ns = clock.nowNs(self.io);
         self.notice = "Pin removed";
+    }
+
+    fn scrollPinnedPins(self: *App, height: u16, direction: isize) void {
+        if (self.pins.len == 0) return;
+        const page_size = @max(@as(usize, height) -| 10, 1);
+        const position: isize = @intCast(self.pinned_selected);
+        const next = @as(i128, position) + @as(i128, direction) * @as(i128, @intCast(page_size));
+        self.pinned_selected = @intCast(@min(@max(next, 0), @as(i128, @intCast(self.pins.len - 1))));
+        self.pinned_scroll = self.pinned_selected;
+    }
+
+    fn togglePickerPin(self: *App, now_ns: u64) void {
+        const selection = self.pin_picker.pickerSignal(self.database) orelse return;
+        self.pins.toggle(.{ .message = selection.message, .signal = selection.signal }) catch {
+            self.notice = "Pin limit reached";
+            return;
+        };
+        self.pins_dirty = true;
+        self.last_pin_change_ns = now_ns;
+        self.notice = if (self.pins.contains(.{ .message = selection.message, .signal = selection.signal }))
+            "Signal pinned"
+        else
+            "Pin removed";
     }
 
     fn handleFilterKey(self: *App, event: zz.KeyEvent) void {
@@ -492,7 +737,7 @@ pub const App = struct {
                 return false;
             },
             .connect => {
-                self.connect.open(ctx.allocator);
+                self.connect.open(ctx.allocator, self.database.doc.buses.items, self.database.doc.messages.items);
                 self.overlay = .connect;
                 return false;
             },
@@ -569,7 +814,6 @@ pub const App = struct {
         }
         return false;
     }
-
     fn adjustTransmitSignal(self: *App, direction: f64, now_ns: u64) void {
         self.transmit.adjustSignal(self.database, direction);
         if (self.transmit.periodic_started) self.sendTransmit();
@@ -636,7 +880,13 @@ pub const App = struct {
             .left => self.connect.moveBus(-1, self.database.doc.buses.items.len),
             .right => self.connect.moveBus(1, self.database.doc.buses.items.len),
             .enter => self.applyConnections(ctx),
-            .char => |character| if (character == 'm') self.connect.toggleMapping(),
+            .char => |character| switch (character) {
+                'm' => self.connect.toggleMapping(),
+                'n' => self.connect.cycleNominalBitrate(),
+                'd' => self.connect.cycleDataBitrate(),
+                'f' => self.connect.toggleFd(),
+                else => {},
+            },
             else => {},
         }
     }
@@ -651,7 +901,17 @@ pub const App = struct {
         for (self.connect.mappings[0..@min(self.database.doc.buses.items.len, self.connect.mappings.len)], 0..) |mapping, bus_index| {
             const choice_index = mapping orelse continue;
             const choice = self.connect.choices[choice_index].?;
-            var device = choice.backend.open(self.allocator, .{ .channel = choice.channel.nameSlice() }) catch |err| {
+            const settings = self.connect.bus_settings[bus_index];
+            if (settings.use_fd and !choice.channel.capabilities.fd) {
+                self.engine.clearAdapters();
+                self.notice = "CAN FD selected for a channel that does not support it";
+                return;
+            }
+            var device = choice.backend.open(self.allocator, .{
+                .channel = choice.channel.nameSlice(),
+                .nominal_bitrate = settings.nominal_bitrate,
+                .data_bitrate = if (settings.use_fd) settings.data_bitrate else null,
+            }) catch |err| {
                 self.engine.clearAdapters();
                 self.notice = @errorName(err);
                 return;
@@ -686,6 +946,13 @@ pub const App = struct {
         self.monitor.toggleDetailFocus(snapshot, self.database);
     }
 
+    fn toggleMonitorBus(self: *App) void {
+        const live_snapshot = self.engine.readSnapshot();
+        const snapshot = if (self.paused) &self.frozen_snapshot else &live_snapshot;
+        self.monitor.toggleSelectedBus(snapshot, self.database);
+        self.monitor.detail_focus = false;
+    }
+
     fn toggleSelectedPin(self: *App, now_ns: u64) void {
         const live_snapshot = self.engine.readSnapshot();
         const snapshot = if (self.paused) &self.frozen_snapshot else &live_snapshot;
@@ -714,6 +981,25 @@ pub const App = struct {
             return;
         };
         self.pins_dirty = false;
+    }
+
+    fn persistPlots(self: *App) void {
+        var saved: config.PlotSet = .{};
+        saved.columns_override = self.plot.columns_override;
+        for (self.plot.targets[0..self.plot.target_count]) |target| {
+            const plotted = target.?;
+            saved.toggle(.{
+                .message = plotted.message_handle,
+                .signal = plotted.signal_index,
+                .plot_index = plotted.plot_index,
+                .window_ns = self.plot.plot_windows_ns[plotted.plot_index],
+            }) catch break;
+        }
+        config.savePlots(self.allocator, self.io, self.config_directory, &self.database_hash, self.database, &saved) catch |err| {
+            self.notice = @errorName(err);
+            return;
+        };
+        self.plots_dirty = false;
     }
 
     fn persistSettings(self: *App) void {
@@ -861,6 +1147,22 @@ pub const App = struct {
                 try writer.writeAll("not mapped\n");
             }
         }
+        if (bus_count > 0) {
+            const settings = self.connect.bus_settings[self.connect.selected_bus];
+            try writer.print("\n{s} rates: nominal {d} bit/s; {s}", .{
+                self.database.doc.buses.items[self.connect.selected_bus].name,
+                settings.nominal_bitrate,
+                if (settings.use_fd) "CAN FD data" else "Classic CAN",
+            });
+            if (settings.use_fd) try writer.print(" {d} bit/s", .{settings.data_bitrate});
+            if (self.connect.mappings[self.connect.selected_bus]) |choice_index| {
+                const choice = self.connect.choices[choice_index].?;
+                if (!choice.channel.capabilities.set_bitrate and std.mem.eql(u8, choice.backend.name, "socketcan")) {
+                    try writer.writeAll(" (configure SocketCAN rate in OS)");
+                }
+            }
+            try writer.writeByte('\n');
+        }
         try writer.writeAll("\nAvailable channels\n");
         const first = self.connect.selected_channel -| 5;
         const last = @min(self.connect.choice_count, first + 12);
@@ -875,7 +1177,7 @@ pub const App = struct {
             });
         }
         try writer.print("\n{s}\n", .{self.connect.notice});
-        try writer.writeAll("up/down channel  left/right bus  m map  Enter connect  Esc cancel\n");
+        try writer.writeAll("up/down channel  left/right bus  m map  n nominal rate  f Classic/FD  d FD data rate\nEnter connect  Esc cancel\n");
     }
 };
 

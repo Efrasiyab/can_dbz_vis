@@ -42,6 +42,48 @@ pub const PinSet = struct {
     }
 };
 
+pub const max_plotted_signals = 20;
+
+pub const PlotSignal = struct {
+    message: usize,
+    signal: usize,
+    plot_index: u8 = 0,
+    window_ns: u64 = 10 * std.time.ns_per_s,
+};
+
+pub const PlotSet = struct {
+    items: [max_plotted_signals]?PlotSignal = @splat(null),
+    len: usize = 0,
+    plot_count: usize = 0,
+    plot_windows_ns: [max_plotted_signals]u64 = @splat(10 * std.time.ns_per_s),
+    columns_override: ?u8 = null,
+
+    pub const Error = error{TooManySignals};
+
+    pub fn contains(self: *const PlotSet, item: PlotSignal) bool {
+        for (self.items[0..self.len]) |existing| {
+            if (existing.?.message == item.message and existing.?.signal == item.signal) return true;
+        }
+        return false;
+    }
+
+    pub fn toggle(self: *PlotSet, item: PlotSignal) Error!void {
+        for (0..self.len) |index| {
+            const existing = self.items[index].?;
+            if (existing.message != item.message or existing.signal != item.signal) continue;
+            for (index..self.len - 1) |move_index| self.items[move_index] = self.items[move_index + 1];
+            self.len -= 1;
+            self.items[self.len] = null;
+            return;
+        }
+        if (self.len == max_plotted_signals) return error.TooManySignals;
+        self.items[self.len] = item;
+        self.len += 1;
+        self.plot_count = @max(self.plot_count, @as(usize, item.plot_index) + 1);
+        self.plot_windows_ns[item.plot_index] = item.window_ns;
+    }
+};
+
 const SavedPin = struct {
     kind: []const u8,
     bus: []const u8,
@@ -49,6 +91,9 @@ const SavedPin = struct {
     ext: bool,
     message: []const u8,
     signal: ?[]const u8 = null,
+    plot: ?u8 = null,
+    window_ns: ?u64 = null,
+    columns: ?u8 = null,
 };
 
 const PinsFile = struct {
@@ -170,6 +215,72 @@ pub fn savePins(
     try writeAtomic(io, directory_path, file_name, json);
 }
 
+pub fn loadPlots(allocator: std.mem.Allocator, io: std.Io, config_dir: []const u8, hash: []const u8, database: *const Database) !PlotSet {
+    const directory_path = try std.fs.path.join(allocator, &.{ config_dir, "plots" });
+    defer allocator.free(directory_path);
+    try std.Io.Dir.cwd().createDirPath(io, directory_path);
+    var directory = try std.Io.Dir.cwd().openDir(io, directory_path, .{});
+    defer directory.close(io);
+    const file_name = try std.fmt.allocPrint(allocator, "{s}.json", .{hash});
+    defer allocator.free(file_name);
+    const source = directory.readFileAlloc(io, file_name, allocator, .limited(1024 * 1024)) catch |err| switch (err) {
+        error.FileNotFound => return .{},
+        else => return err,
+    };
+    defer allocator.free(source);
+    const parsed = std.json.parseFromSlice(PinsFile, allocator, source, .{ .allocate = .alloc_always }) catch return error.InvalidPlotsFile;
+    defer parsed.deinit();
+    if (parsed.value.version != 1) return error.UnsupportedPlotsVersion;
+
+    var result: PlotSet = .{};
+    for (parsed.value.pins) |saved| {
+        const signal_name = saved.signal orelse continue;
+        const id = std.fmt.parseInt(u32, saved.id, 16) catch continue;
+        const handle = database.compiled.findMessage(saved.bus, id, saved.ext) orelse continue;
+        const message = database.compiled.messages[handle];
+        if (!std.mem.eql(u8, message.name, saved.message)) continue;
+        const signal = try database.compiled.findSignal(handle, signal_name) orelse continue;
+        const plot_index = saved.plot orelse 0;
+        const window_ns = saved.window_ns orelse 10 * std.time.ns_per_s;
+        result.toggle(.{ .message = handle, .signal = signal, .plot_index = plot_index, .window_ns = window_ns }) catch break;
+        result.columns_override = saved.columns;
+    }
+    return result;
+}
+
+pub fn savePlots(allocator: std.mem.Allocator, io: std.Io, config_dir: []const u8, hash: []const u8, database: *const Database, plots: *const PlotSet) !void {
+    const directory_path = try std.fs.path.join(allocator, &.{ config_dir, "plots" });
+    defer allocator.free(directory_path);
+    try std.Io.Dir.cwd().createDirPath(io, directory_path);
+    var saved: [max_plotted_signals]SavedPin = undefined;
+    var id_buffers: [max_plotted_signals][8]u8 = undefined;
+    for (plots.items[0..plots.len], 0..) |maybe_plot, index| {
+        const plot = maybe_plot.?;
+        const message = database.compiled.messages[plot.message];
+        const signal_index = plot.signal;
+        const id = try std.fmt.bufPrint(&id_buffers[index], "{X}", .{message.id});
+        saved[index] = .{
+            .kind = "signal",
+            .bus = message.bus,
+            .id = id,
+            .ext = message.extended,
+            .message = message.name,
+            .signal = message.signals[signal_index].name,
+            .plot = plot.plot_index,
+            .window_ns = plots.plot_windows_ns[plot.plot_index],
+            .columns = plots.columns_override,
+        };
+    }
+    const json = try std.json.Stringify.valueAlloc(allocator, PinsFile{
+        .database = database.doc.name orelse "",
+        .pins = saved[0..plots.len],
+    }, .{ .whitespace = .indent_2 });
+    defer allocator.free(json);
+    const file_name = try std.fmt.allocPrint(allocator, "{s}.json", .{hash});
+    defer allocator.free(file_name);
+    try writeAtomic(io, directory_path, file_name, json);
+}
+
 fn writeAtomic(io: std.Io, directory_path: []const u8, file_name: []const u8, contents: []const u8) !void {
     try std.Io.Dir.cwd().createDirPath(io, directory_path);
     var directory = try std.Io.Dir.cwd().openDir(io, directory_path, .{});
@@ -237,6 +348,16 @@ test "pins persist as database-scoped JSON and reload to compiled handles" {
     try std.testing.expectEqual(@as(usize, 2), loaded.len);
     try std.testing.expect(loaded.contains(.{ .message = handle }));
     try std.testing.expect(loaded.contains(.{ .message = handle, .signal = 0 }));
+
+    var plots: PlotSet = .{};
+    plots.columns_override = 3;
+    try plots.toggle(.{ .message = handle, .signal = 0, .plot_index = 2, .window_ns = 100_000 });
+    try savePlots(allocator, std.testing.io, config_dir, &hash, &database, &plots);
+    const loaded_plots = try loadPlots(allocator, std.testing.io, config_dir, &hash, &database);
+    try std.testing.expectEqual(@as(usize, 1), loaded_plots.len);
+    try std.testing.expect(loaded_plots.contains(.{ .message = handle, .signal = 0, .plot_index = 2, .window_ns = 100_000 }));
+    try std.testing.expectEqual(@as(u64, 100_000), loaded_plots.plot_windows_ns[2]);
+    try std.testing.expectEqual(@as(?u8, 3), loaded_plots.columns_override);
 
     const settings = Settings{ .fps = 45, .plot_window_seconds = 20 };
     try saveSettings(allocator, std.testing.io, config_dir, settings);

@@ -8,10 +8,15 @@ const config = @import("config.zig");
 const Line = struct {
     bytes: [256]u8 = undefined,
     len: usize = 0,
+    highlight: bool = false,
 };
 
 pub const State = struct {
     selected_row: usize = 0,
+    collapsed_buses: [256]bool = @splat(false),
+    selected_bus_header: ?u8 = null,
+    folded_message_id: u32 = 0,
+    folded_message_extended: bool = false,
     trace_mode: bool = false,
     database_only: bool = false,
     detail_focus: bool = false,
@@ -30,14 +35,15 @@ pub const State = struct {
             self.selected_signal = @intCast(@min(@max(next_signal, 0), @as(i128, @intCast(signal_count - 1))));
             return;
         }
-        const count = visibleCount(self, snapshot, database);
+        const count = displayLineCount(self, snapshot, database);
         if (count == 0) {
             self.selected_row = 0;
+            self.selected_bus_header = null;
             return;
         }
-        const position: isize = @intCast(self.selected_row);
+        const position: isize = @intCast(selectedDisplayLine(self, snapshot, database) orelse 0);
         const next = @as(i128, position) + amount;
-        self.selected_row = @intCast(@min(@max(next, 0), @as(i128, @intCast(count - 1))));
+        setSelectionAtDisplayLine(self, snapshot, database, @intCast(@min(@max(next, 0), @as(i128, @intCast(count - 1)))));
     }
 
     pub fn appendFilter(self: *State, character: u8) void {
@@ -56,6 +62,26 @@ pub const State = struct {
         self.filter_len = 0;
         self.filter = @splat(0);
         self.selected_row = 0;
+        self.selected_bus_header = null;
+    }
+
+    pub fn toggleSelectedBus(self: *State, snapshot: *const store.Snapshot, database: *const Database) void {
+        if (self.selected_bus_header) |bus| {
+            self.collapsed_buses[bus] = !self.collapsed_buses[bus];
+            return;
+        }
+        const frame = selectedFrame(self, snapshot, database) orelse return;
+        const bus = frame.bus;
+        var preceding: usize = 0;
+        for (0..bus) |bus_index| {
+            if (self.collapsed_buses[bus_index]) continue;
+            preceding += countVisibleOnBus(self, snapshot, database, @intCast(bus_index));
+        }
+        self.collapsed_buses[bus] = true;
+        self.selected_bus_header = bus;
+        self.folded_message_id = frame.id;
+        self.folded_message_extended = frame.flags.extended;
+        self.selected_row = preceding;
     }
 
     pub fn toggleDetailFocus(self: *State, snapshot: *const store.Snapshot, database: *const Database) void {
@@ -79,6 +105,7 @@ pub fn render(
     database: *const Database,
     snapshot: *const store.Snapshot,
     state: *const State,
+    pins: *const config.PinSet,
 ) !void {
     const filter = state.filter[0..state.filter_len];
     const selected_source = selectedSourceIndex(state, snapshot, database);
@@ -103,90 +130,225 @@ pub fn render(
     try writePaddedStyled(writer, allocator, right_header.bytes[0..right_header.len], right_width, header_style);
     try writer.writeByte('\n');
 
-    const body_rows: usize = if (height > 12) height - 12 else 3;
-    const rows = @min(body_rows, 24);
-    var detail_lines: [24]Line = @splat(.{});
+    var left_columns = Line{};
+    const data_bytes = (left_width -| 38) / 3;
+    setLine(&left_columns, "  {s:<3} {s:<3} {s:<10} {s:<13} {s:>2} DATA ({d}B)", .{
+        "TYPE", "FMT", "ID", "MESSAGE", "LEN", data_bytes,
+    });
+    var right_columns = Line{};
+    setLine(&right_columns, "Message details / signal values", .{});
+    const column_style = (zz.Style{}).fg(zz.Color.brightYellow).bold(true).inline_style(true);
+    try writePaddedStyled(writer, allocator, left_columns.bytes[0..left_columns.len], left_width, column_style);
+    try writeStyled(writer, allocator, " | ", (zz.Style{}).fg(zz.Color.color256(60)).inline_style(true));
+    try writePaddedStyled(writer, allocator, right_columns.bytes[0..right_columns.len], right_width, column_style);
+    try writer.writeByte('\n');
+
+    const rows = @as(usize, height) -| 3;
+    const total_display_lines = displayLineCount(state, snapshot, database);
+    const selected_display_line = selectedDisplayLine(state, snapshot, database) orelse 0;
+    const first_display_line = if (selected_display_line + 1 > rows) selected_display_line + 1 - rows else 0;
+    var detail_capacity: usize = 9;
+    if (selected_frame) |frame| {
+        if (database.compiled.findMessage(busName(database, frame.bus), frame.id, frame.flags.extended)) |handle| {
+            detail_capacity += database.compiled.messages[handle].signals.len;
+        }
+    }
+    const detail_lines = try allocator.alloc(Line, detail_capacity);
+    defer allocator.free(detail_lines);
+    @memset(detail_lines, .{});
     const detail_count = if (selected_frame) |frame|
-        buildDetailLines(&detail_lines, frame, selectedSourceRow(snapshot, state, selected_source), database, state)
+        buildDetailLines(detail_lines, frame, selectedSourceRow(snapshot, state, selected_source), database, state, pins)
     else blk: {
         setLine(&detail_lines[0], "No frames received", .{});
         break :blk 1;
     };
+    const selected_signal_line = state.selected_signal + 9;
+    const detail_first_line = if (state.detail_focus and selected_signal_line + 1 > rows)
+        @min(selected_signal_line + 1 - rows, detail_count -| rows)
+    else
+        0;
 
-    var visible_index: usize = 0;
-    var source_index: usize = 0;
-    while (visible_index < rows) : (source_index += 1) {
-        const frame = sourceFrame(snapshot, state.trace_mode, source_index) orelse break;
-        if (!isVisible(state, frame, database)) continue;
-
+    if (total_display_lines == 0) {
         var left = Line{};
-        formatMessageRow(&left, frame, if (!state.trace_mode) snapshot.rows[source_index] else null, database, visible_index == state.selected_row);
-        const right = if (visible_index < detail_count) &detail_lines[visible_index] else null;
-        try writeColumns(allocator, writer, &left, right, left_width, right_width, visible_index == state.selected_row);
-        visible_index += 1;
+        setLine(&left, "{s}", .{if (state.filter_len == 0) "No messages" else "No matches"});
+        try writeColumns(allocator, writer, &left, if (detail_count > 0) &detail_lines[0] else null, left_width, right_width, false);
+        return;
     }
-    if (visible_index == 0) {
-        var left = Line{};
-        if (state.filter_len == 0) {
-            setLine(&left, "No messages", .{});
-        } else {
-            setLine(&left, "No matches", .{});
+
+    var display_line: usize = 0;
+    var visible_message_index: usize = 0;
+    for (0..256) |bus_index| {
+        const bus = @as(u8, @intCast(bus_index));
+        const group_count = countVisibleOnBus(state, snapshot, database, bus);
+        if (group_count == 0) continue;
+
+        if (display_line >= first_display_line and display_line < first_display_line + rows) {
+            var left = Line{};
+            setLine(&left, "{s} {s} ({d})", .{
+                if (state.collapsed_buses[bus_index]) ">" else "v",
+                busName(database, bus),
+                group_count,
+            });
+            const selected_header = state.selected_bus_header != null and state.selected_bus_header.? == bus;
+            const right_index = detail_first_line + display_line - first_display_line;
+            try writeColumns(allocator, writer, &left, if (right_index < detail_count) &detail_lines[right_index] else null, left_width, right_width, selected_header);
         }
-        for (0..@min(rows, detail_count)) |line_index| {
-            try writeColumns(allocator, writer, if (line_index == 0) &left else null, &detail_lines[line_index], left_width, right_width, false);
+        display_line += 1;
+        if (state.collapsed_buses[bus_index]) continue;
+
+        const length = if (state.trace_mode) snapshot.trace_len else snapshot.row_count;
+        for (0..length) |source_index| {
+            const frame = sourceFrame(snapshot, state.trace_mode, source_index).?;
+            if (frame.bus != bus or !isVisible(state, frame, database)) continue;
+            if (display_line >= first_display_line and display_line < first_display_line + rows) {
+                var left = Line{};
+                const selected_message = state.selected_bus_header == null and visible_message_index == state.selected_row;
+                formatMessageRow(&left, frame, database, selected_message, data_bytes);
+                const right_index = detail_first_line + display_line - first_display_line;
+                try writeColumns(allocator, writer, &left, if (right_index < detail_count) &detail_lines[right_index] else null, left_width, right_width, selected_message);
+            }
+            visible_message_index += 1;
+            display_line += 1;
         }
-        if (detail_count == 0) try writeColumns(allocator, writer, &left, null, left_width, right_width, false);
+    }
+    const list_rows = @min(rows, total_display_lines -| first_display_line);
+    for (list_rows..rows) |row_index| {
+        const detail_index = detail_first_line + row_index;
+        try writeColumns(allocator, writer, null, if (detail_index < detail_count) &detail_lines[detail_index] else null, left_width, right_width, false);
     }
 }
 
-pub fn renderPins(allocator: std.mem.Allocator, writer: *std.Io.Writer, database: *const Database, snapshot: *const store.Snapshot, pins: *const config.PinSet, selected_pin: usize) !void {
+pub fn renderPins(allocator: std.mem.Allocator, writer: *std.Io.Writer, width: u16, database: *const Database, snapshot: *const store.Snapshot, pins: *const config.PinSet, selected_pin: usize, first_pin: usize, visible_rows: usize, horizontal_scroll: usize) !void {
     if (pins.len == 0) return;
-    for (pins.items[0..pins.len], 0..) |maybe_pin, pin_index| {
+    var value_column_width: usize = 14;
+    for (pins.items[0..pins.len]) |maybe_pin| {
+        const pin = maybe_pin.?;
+        if (pin.signal != null or pin.message >= database.compiled.messages.len) continue;
+        const message = database.compiled.messages[pin.message];
+        const latest = findLatestRow(snapshot, message.bus, message.id, message.extended, database);
+        const payload_length = if (latest) |row| row.frame.len else message.length;
+        value_column_width = @max(value_column_width, @as(usize, payload_length) * 3);
+    }
+    const value_width = @as(usize, width) -| 62;
+    try writeStyled(writer, allocator, "   ", (zz.Style{}).fg(zz.Color.brightYellow).bold(true).inline_style(true));
+    try writePaddedStyled(writer, allocator, "BUS", 20, (zz.Style{}).fg(zz.Color.brightYellow).bold(true).inline_style(true));
+    try writer.writeByte(' ');
+    try writePaddedStyled(writer, allocator, "MESSAGE / SIGNAL", 36, (zz.Style{}).fg(zz.Color.brightYellow).bold(true).inline_style(true));
+    try writer.writeByte(' ');
+    var value_header = Line{};
+    var header_writer: std.Io.Writer = .fixed(&value_header.bytes);
+    header_writer.writeAll("VALUE/DATA") catch {};
+    for ("VALUE/DATA".len..value_column_width) |_| header_writer.writeByte(' ') catch {};
+    header_writer.print(" {s:>8} {s:>11} {s:>11} {s:>24}", .{ "COUNT", "RX(s)", "DELTA(ms)", "CYCLE min/avg/max(ms)" }) catch {};
+    value_header.len = header_writer.buffered().len;
+    const header_start = @min(horizontal_scroll, value_header.len);
+    const header_end = @min(value_header.len, header_start +| value_width);
+    try writePaddedStyled(writer, allocator, value_header.bytes[header_start..header_end], value_width, (zz.Style{}).fg(zz.Color.brightYellow).bold(true).inline_style(true));
+    try writer.writeByte('\n');
+    const max_first_pin = pins.len -| @max(visible_rows, 1);
+    var viewport_start = @min(first_pin, max_first_pin);
+    if (selected_pin < viewport_start) {
+        viewport_start = selected_pin;
+    } else if (selected_pin >= viewport_start + @max(visible_rows, 1)) {
+        viewport_start = @min(selected_pin + 1 - @max(visible_rows, 1), max_first_pin);
+    }
+    const viewport_end = @min(pins.len, viewport_start + @max(visible_rows, 1));
+    for (pins.items[viewport_start..viewport_end], viewport_start..) |maybe_pin, pin_index| {
         const pin = maybe_pin.?;
         if (pin.message >= database.compiled.messages.len) continue;
         const message = database.compiled.messages[pin.message];
-        const frame = findLatest(snapshot, message.bus, message.id, message.extended, database);
+        const row = findLatestRow(snapshot, message.bus, message.id, message.extended, database);
+        const frame = if (row) |latest| latest.frame else null;
         const selected = pin_index == selected_pin;
         const active_bg: zz.Color = if (selected) zz.Color.color256(24) else .none;
         try writeStyled(writer, allocator, if (selected) " > " else "   ", (zz.Style{}).fg(if (selected) zz.Color.brightWhite else zz.Color.brightCyan).bg(active_bg).bold(selected).inline_style(true));
-        try writeStyled(writer, allocator, message.bus, (zz.Style{}).fg(zz.Color.gray(15)).bg(active_bg).inline_style(true));
-        try writeStyled(writer, allocator, "  ", (zz.Style{}).bg(active_bg).inline_style(true));
-        try writeStyled(writer, allocator, message.name, (zz.Style{}).fg(zz.Color.brightWhite).bg(active_bg).bold(true).inline_style(true));
+        try writePaddedStyled(writer, allocator, message.bus, 20, (zz.Style{}).fg(zz.Color.gray(15)).bg(active_bg).inline_style(true));
+        try writer.writeByte(' ');
+        var title = Line{};
         if (pin.signal) |signal_index| {
             if (signal_index < message.signals.len) {
-                try writeStyled(writer, allocator, ".", (zz.Style{}).fg(zz.Color.gray(15)).bg(active_bg).inline_style(true));
-                try writeStyled(writer, allocator, message.signals[signal_index].name, (zz.Style{}).fg(zz.Color.brightGreen).bg(active_bg).inline_style(true));
+                setLine(&title, "{s}.{s}", .{ message.name, message.signals[signal_index].name });
+            } else {
+                setLine(&title, "{s}", .{message.name});
             }
+        } else {
+            setLine(&title, "{s}", .{message.name});
         }
-        if (frame) |latest| {
+        try writePaddedStyled(writer, allocator, title.bytes[0..title.len], 36, (zz.Style{}).fg(zz.Color.brightWhite).bg(active_bg).bold(true).inline_style(true));
+        try writer.writeByte(' ');
+        var value_data = Line{};
+        var count_text: [24]u8 = undefined;
+        var rx_text: [24]u8 = undefined;
+        var delta_text: [24]u8 = undefined;
+        var cycle_text: [40]u8 = undefined;
+        var count_len: usize = 0;
+        var rx_len: usize = 0;
+        var delta_len: usize = 0;
+        var cycle_len: usize = 0;
+        if (row) |latest_row| {
+            const latest = latest_row.frame;
+            var value_writer: std.Io.Writer = .fixed(&value_data.bytes);
             if (pin.signal) |signal_index| {
                 if (signal_index < message.signals.len) {
-                    const value = database.compiled.decodeSignalPhysical(pin.message, signal_index, latest.data[0..latest.len]) catch null;
-                    if (value) |physical| {
-                        const formatted = try std.fmt.allocPrint(allocator, " = {d:.3}", .{physical});
-                        defer allocator.free(formatted);
-                        try writeStyled(writer, allocator, formatted, (zz.Style{}).fg(zz.Color.brightYellow).bg(active_bg).inline_style(true));
+                    const physical_value = database.compiled.decodeSignalPhysical(pin.message, signal_index, latest.data[0..latest.len]) catch null;
+                    const unit = database.doc.messages.items[pin.message].signals.items[signal_index].unit orelse "";
+                    if (physical_value) |physical| {
+                        value_writer.print("{d:.2} {s}", .{ physical, unit }) catch {};
+                    } else {
+                        value_writer.writeAll("inactive") catch {};
                     }
                 }
             } else {
-                var payload: [64 * 3]u8 = undefined;
-                var payload_writer: std.Io.Writer = .fixed(&payload);
-                try writeHex(&payload_writer, latest.data[0..latest.len]);
-                try writeStyled(writer, allocator, payload_writer.buffered(), (zz.Style{}).fg(zz.Color.brightYellow).bg(active_bg).inline_style(true));
+                writeHex(&value_writer, latest.data[0..latest.len]) catch {};
+            }
+            value_data.len = value_writer.buffered().len;
+            count_len = (std.fmt.bufPrint(&count_text, "{d}", .{latest_row.count}) catch unreachable).len;
+            rx_len = (std.fmt.bufPrint(&rx_text, "{d:.3}", .{@as(f64, @floatFromInt(latest.timestamp_ns)) / std.time.ns_per_s}) catch unreachable).len;
+            if (latest_row.count > 1) {
+                delta_len = (std.fmt.bufPrint(&delta_text, "{d:.3}", .{@as(f64, @floatFromInt(latest_row.last_delta_ns)) / std.time.ns_per_ms}) catch unreachable).len;
+            } else {
+                delta_len = (std.fmt.bufPrint(&delta_text, "n/a", .{}) catch unreachable).len;
+            }
+            if (latest_row.cycle_samples != 0) {
+                cycle_len = (std.fmt.bufPrint(&cycle_text, "{d:.1}/{d:.1}/{d:.1}", .{
+                    @as(f64, @floatFromInt(latest_row.cycle_min_ns)) / std.time.ns_per_ms,
+                    @as(f64, @floatFromInt(latest_row.cycle_avg_ns)) / std.time.ns_per_ms,
+                    @as(f64, @floatFromInt(latest_row.cycle_max_ns)) / std.time.ns_per_ms,
+                }) catch unreachable).len;
+            } else {
+                cycle_len = (std.fmt.bufPrint(&cycle_text, "n/a", .{}) catch unreachable).len;
             }
         } else {
-            try writeStyled(writer, allocator, "  waiting", (zz.Style{}).fg(zz.Color.gray(12)).italic(true).inline_style(true));
+            setLine(&value_data, "waiting", .{});
+            count_len = (std.fmt.bufPrint(&count_text, "-", .{}) catch unreachable).len;
+            rx_len = (std.fmt.bufPrint(&rx_text, "-", .{}) catch unreachable).len;
+            delta_len = (std.fmt.bufPrint(&delta_text, "-", .{}) catch unreachable).len;
+            cycle_len = (std.fmt.bufPrint(&cycle_text, "-", .{}) catch unreachable).len;
         }
+        var value = Line{};
+        var value_line_writer: std.Io.Writer = .fixed(&value.bytes);
+        const value_text = value_data.bytes[0..@min(value_data.len, value_column_width)];
+        value_line_writer.writeAll(value_text) catch {};
+        for (value_text.len..value_column_width) |_| value_line_writer.writeByte(' ') catch {};
+        value_line_writer.print(" {s:>8} {s:>11} {s:>11} {s:>24}", .{
+            count_text[0..count_len],
+            rx_text[0..rx_len],
+            delta_text[0..delta_len],
+            cycle_text[0..cycle_len],
+        }) catch {};
+        value.len = value_line_writer.buffered().len;
+        const value_start = @min(horizontal_scroll, value.len);
+        const value_end = @min(value.len, value_start +| value_width);
+        try writePaddedStyled(writer, allocator, value.bytes[value_start..value_end], value_width, (zz.Style{}).fg(if (frame != null) zz.Color.brightYellow else zz.Color.gray(12)).bg(active_bg).inline_style(true));
         try writer.writeByte('\n');
     }
 }
 
 pub fn visibleCount(state: *const State, snapshot: *const store.Snapshot, database: *const Database) usize {
-    const length = if (state.trace_mode) snapshot.trace_len else snapshot.row_count;
     var count: usize = 0;
-    for (0..length) |index| {
-        const frame = sourceFrame(snapshot, state.trace_mode, index).?;
-        if (isVisible(state, frame, database)) count += 1;
+    for (0..256) |bus_index| {
+        if (state.collapsed_buses[bus_index]) continue;
+        count += countVisibleOnBus(state, snapshot, database, @intCast(bus_index));
     }
     return count;
 }
@@ -198,14 +360,105 @@ pub fn selectedFrame(state: *const State, snapshot: *const store.Snapshot, datab
 
 fn selectedSourceIndex(state: *const State, snapshot: *const store.Snapshot, database: *const Database) ?usize {
     const length = if (state.trace_mode) snapshot.trace_len else snapshot.row_count;
+    if (state.selected_bus_header) |bus| {
+        for (0..length) |source_index| {
+            const frame = sourceFrame(snapshot, state.trace_mode, source_index).?;
+            if (frame.bus == bus and frame.id == state.folded_message_id and frame.flags.extended == state.folded_message_extended and isVisible(state, frame, database)) return source_index;
+        }
+        for (0..length) |source_index| {
+            const frame = sourceFrame(snapshot, state.trace_mode, source_index).?;
+            if (frame.bus == bus and isVisible(state, frame, database)) return source_index;
+        }
+        return null;
+    }
     var visible_index: usize = 0;
-    for (0..length) |source_index| {
-        const frame = sourceFrame(snapshot, state.trace_mode, source_index).?;
-        if (!isVisible(state, frame, database)) continue;
-        if (visible_index == state.selected_row) return source_index;
-        visible_index += 1;
+    for (0..256) |bus_index| {
+        if (state.collapsed_buses[bus_index]) continue;
+        for (0..length) |source_index| {
+            const frame = sourceFrame(snapshot, state.trace_mode, source_index).?;
+            if (frame.bus != bus_index or !isVisible(state, frame, database)) continue;
+            if (visible_index == state.selected_row) return source_index;
+            visible_index += 1;
+        }
     }
     return null;
+}
+
+fn countVisibleOnBus(state: *const State, snapshot: *const store.Snapshot, database: *const Database, bus: u8) usize {
+    const length = if (state.trace_mode) snapshot.trace_len else snapshot.row_count;
+    var count: usize = 0;
+    for (0..length) |source_index| {
+        const frame = sourceFrame(snapshot, state.trace_mode, source_index).?;
+        if (frame.bus == bus and isVisible(state, frame, database)) count += 1;
+    }
+    return count;
+}
+
+fn firstVisibleOnBus(state: *const State, snapshot: *const store.Snapshot, database: *const Database, bus: u8) ?Frame {
+    const length = if (state.trace_mode) snapshot.trace_len else snapshot.row_count;
+    for (0..length) |source_index| {
+        const frame = sourceFrame(snapshot, state.trace_mode, source_index).?;
+        if (frame.bus == bus and isVisible(state, frame, database)) return frame;
+    }
+    return null;
+}
+
+fn displayLineCount(state: *const State, snapshot: *const store.Snapshot, database: *const Database) usize {
+    var count: usize = 0;
+    for (0..256) |bus_index| {
+        const message_count = countVisibleOnBus(state, snapshot, database, @intCast(bus_index));
+        if (message_count == 0) continue;
+        count += 1;
+        if (!state.collapsed_buses[bus_index]) count += message_count;
+    }
+    return count;
+}
+
+fn selectedDisplayLine(state: *const State, snapshot: *const store.Snapshot, database: *const Database) ?usize {
+    var display_line: usize = 0;
+    var visible_message_index: usize = 0;
+    for (0..256) |bus_index| {
+        const bus = @as(u8, @intCast(bus_index));
+        const message_count = countVisibleOnBus(state, snapshot, database, bus);
+        if (message_count == 0) continue;
+        if (state.selected_bus_header != null and state.selected_bus_header.? == bus) return display_line;
+        display_line += 1;
+        if (state.collapsed_buses[bus_index]) continue;
+        if (state.selected_row >= visible_message_index and state.selected_row < visible_message_index + message_count) {
+            return display_line + (state.selected_row - visible_message_index);
+        }
+        visible_message_index += message_count;
+        display_line += message_count;
+    }
+    return null;
+}
+
+fn setSelectionAtDisplayLine(state: *State, snapshot: *const store.Snapshot, database: *const Database, selected_line: usize) void {
+    var display_line: usize = 0;
+    var visible_message_index: usize = 0;
+    for (0..256) |bus_index| {
+        const bus = @as(u8, @intCast(bus_index));
+        const message_count = countVisibleOnBus(state, snapshot, database, bus);
+        if (message_count == 0) continue;
+        if (selected_line == display_line) {
+            state.selected_bus_header = bus;
+            state.selected_row = visible_message_index;
+            if (firstVisibleOnBus(state, snapshot, database, bus)) |frame| {
+                state.folded_message_id = frame.id;
+                state.folded_message_extended = frame.flags.extended;
+            }
+            return;
+        }
+        display_line += 1;
+        if (state.collapsed_buses[bus_index]) continue;
+        if (selected_line < display_line + message_count) {
+            state.selected_bus_header = null;
+            state.selected_row = visible_message_index + selected_line - display_line;
+            return;
+        }
+        visible_message_index += message_count;
+        display_line += message_count;
+    }
 }
 
 fn selectedSourceRow(snapshot: *const store.Snapshot, state: *const State, source_index: ?usize) ?store.MessageRow {
@@ -241,67 +494,92 @@ fn busName(database: *const Database, index: u8) []const u8 {
     return database.doc.buses.items[index].name;
 }
 
-fn findLatest(snapshot: *const store.Snapshot, bus: []const u8, id: u32, extended: bool, database: *const Database) ?Frame {
+fn findLatestRow(snapshot: *const store.Snapshot, bus: []const u8, id: u32, extended: bool, database: *const Database) ?store.MessageRow {
     for (snapshot.rows[0..snapshot.row_count]) |row| {
         const frame = row.frame;
-        if (frame.id == id and frame.flags.extended == extended and std.mem.eql(u8, busName(database, frame.bus), bus)) return frame;
+        if (frame.id == id and frame.flags.extended == extended and std.mem.eql(u8, busName(database, frame.bus), bus)) return row;
     }
     return null;
 }
 
-fn formatMessageRow(line: *Line, frame: Frame, row: ?store.MessageRow, database: *const Database, selected: bool) void {
+fn formatMessageRow(line: *Line, frame: Frame, database: *const Database, selected: bool, data_bytes: usize) void {
     const bus = busName(database, frame.bus);
     const handle = database.compiled.findMessage(bus, frame.id, frame.flags.extended);
     const name = if (handle) |message_handle| database.compiled.messages[message_handle].name else "?";
     var writer: std.Io.Writer = .fixed(&line.bytes);
-    writer.print("{s} {s:<10} 0x{X:0>3} {s:<16} {d:>2} ", .{
-        if (selected) ">" else " ",
-        bus,
+    const visible_name = name[0..@min(name.len, 13)];
+    writer.print("{s}{s:<3} {s:<3} 0x{X:0>8} {s:<13} {d:>2} ", .{
+        if (selected) "> " else "  ",
+        if (frame.flags.extended) "EXT" else "STD",
+        if (frame.flags.fd) "FD" else "CAN",
         frame.id,
-        name,
+        visible_name,
         frame.len,
     }) catch {};
-    const bytes_to_show = @min(frame.len, 3);
+    const bytes_to_show = @min(frame.len, data_bytes);
     for (frame.data[0..bytes_to_show]) |byte| writer.print("{X:0>2} ", .{byte}) catch {};
-    if (row) |stats| writer.print(" {d} {d:.1}ms", .{ stats.count, @as(f64, @floatFromInt(stats.cycle_avg_ns)) / std.time.ns_per_ms }) catch {};
     line.len = writer.buffered().len;
 }
 
-fn buildDetailLines(lines: *[24]Line, frame: Frame, row: ?store.MessageRow, database: *const Database, state: *const State) usize {
+fn buildDetailLines(lines: []Line, frame: Frame, row: ?store.MessageRow, database: *const Database, state: *const State, pins: *const config.PinSet) usize {
     const bus = busName(database, frame.bus);
     const handle = database.compiled.findMessage(bus, frame.id, frame.flags.extended) orelse {
-        setLine(&lines[0], "Unknown message on {s}", .{bus});
-        setLine(&lines[1], "ID 0x{X:0>3} len {d}", .{ frame.id, frame.len });
+        setLine(&lines[0], "Unknown {s} message on {s}", .{ frameKindLabel(frame), bus });
+        setLine(&lines[1], "{s}  ID 0x{X:0>3} len {d}", .{ idFormatLabel(frame), frame.id, frame.len });
         setHexLine(&lines[2], "Data: ", frame.data[0..frame.len]);
         return 3;
     };
     const message = database.compiled.messages[handle];
-    setLine(&lines[0], "{s} ({s})", .{ message.name, if (frame.flags.extended) "extended" else "standard" });
-    setLine(&lines[1], "Bus {s}  ID 0x{X:0>3}  len {d}{s}", .{ bus, frame.id, frame.len, if (frame.flags.fd) " FD" else "" });
+    setLine(&lines[0], "{s} ({s}, {s})", .{ message.name, frameKindLabel(frame), idFormatLabel(frame) });
+    setLine(&lines[1], "Bus {s}  ID 0x{X:0>3}  len {d}", .{ bus, frame.id, frame.len });
     if (row) |stats| {
-        setLine(&lines[2], "Count {d}  cycle min/avg/max {d:.1}/{d:.1}/{d:.1} ms", .{
-            stats.count,
-            @as(f64, @floatFromInt(stats.cycle_min_ns)) / std.time.ns_per_ms,
-            @as(f64, @floatFromInt(stats.cycle_avg_ns)) / std.time.ns_per_ms,
-            @as(f64, @floatFromInt(stats.cycle_max_ns)) / std.time.ns_per_ms,
-        });
+        setLine(&lines[2], "{s:<12} {d:>12}", .{ "Count", stats.count });
+        setLine(&lines[3], "{s:<12} {d:>10.3} ms", .{ "Cycle min", @as(f64, @floatFromInt(stats.cycle_min_ns)) / std.time.ns_per_ms });
+        setLine(&lines[4], "{s:<12} {d:>10.3} ms", .{ "Cycle avg", @as(f64, @floatFromInt(stats.cycle_avg_ns)) / std.time.ns_per_ms });
+        setLine(&lines[5], "{s:<12} {d:>10.3} ms", .{ "Cycle max", @as(f64, @floatFromInt(stats.cycle_max_ns)) / std.time.ns_per_ms });
     } else {
-        setLine(&lines[2], "Chronological frame", .{});
+        setLine(&lines[2], "{s:<12} {s:>12}", .{ "Count", "trace" });
+        setLine(&lines[3], "{s:<12} {s:>10}", .{ "Cycle min", "n/a" });
+        setLine(&lines[4], "{s:<12} {s:>10}", .{ "Cycle avg", "n/a" });
+        setLine(&lines[5], "{s:<12} {s:>10}", .{ "Cycle max", "n/a" });
     }
-    setHexLine(&lines[3], "Data: ", frame.data[0..frame.len]);
+    setHexLine(&lines[6], "Data: ", frame.data[0..frame.len]);
+    setLine(&lines[7], "{s:<12} {d:>10.3} s", .{ "Last RX", @as(f64, @floatFromInt(frame.timestamp_ns)) / std.time.ns_per_s });
+    if (row) |stats| {
+        if (stats.count > 1) {
+            setLine(&lines[8], "{s:<12} {d:>10.3} ms", .{ "Last delta", @as(f64, @floatFromInt(stats.last_delta_ns)) / std.time.ns_per_ms });
+        } else {
+            setLine(&lines[8], "{s:<12} {s:>10}", .{ "Last delta", "n/a" });
+        }
+    } else {
+        setLine(&lines[8], "{s:<12} {s:>10}", .{ "Last delta", "n/a" });
+    }
 
-    var count: usize = 4;
+    var count: usize = 9;
     for (message.signals, 0..) |signal, signal_index| {
-        if (count == lines.len) break;
         const marker = if (state.detail_focus and state.selected_signal == signal_index) "> " else "  ";
+        lines[count].highlight = pins.contains(.{ .message = handle, .signal = signal_index });
         if (database.compiled.decodeSignalPhysical(handle, signal_index, frame.data[0..frame.len])) |value| {
-            setLine(&lines[count], "{s}{s:<20} {d:.4}", .{ marker, signal.name, value });
+            const unit = database.doc.messages.items[handle].signals.items[signal_index].unit orelse "";
+            if (unit.len == 0) {
+                setLine(&lines[count], "{s}{s:<20} {d:.4}", .{ marker, signal.name, value });
+            } else {
+                setLine(&lines[count], "{s}{s:<20} {d:.4} {s}", .{ marker, signal.name, value, unit });
+            }
         } else |_| {
             setLine(&lines[count], "{s}{s:<20} inactive", .{ marker, signal.name });
         }
         count += 1;
     }
     return count;
+}
+
+fn frameKindLabel(frame: Frame) []const u8 {
+    return if (frame.flags.fd) "CAN FD" else "Classic CAN";
+}
+
+fn idFormatLabel(frame: Frame) []const u8 {
+    return if (frame.flags.extended) "Extended ID (29-bit)" else "Standard ID (11-bit)";
 }
 
 fn writeHex(writer: *std.Io.Writer, bytes: []const u8) !void {
@@ -339,7 +617,11 @@ fn writeColumns(allocator: std.mem.Allocator, writer: *std.Io.Writer, left: ?*co
     }
     try writeStyled(writer, allocator, " | ", (zz.Style{}).fg(zz.Color.color256(60)).inline_style(true));
     if (right) |line| {
-        try writePadded(writer, line.bytes[0..line.len], right_width);
+        if (line.highlight) {
+            try writePaddedStyled(writer, allocator, line.bytes[0..line.len], right_width, (zz.Style{}).fg(zz.Color.brightYellow).bold(true).inline_style(true));
+        } else {
+            try writePadded(writer, line.bytes[0..line.len], right_width);
+        }
     } else {
         try writePadded(writer, "", right_width);
     }
@@ -372,4 +654,161 @@ fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
         if (std.ascii.eqlIgnoreCase(haystack[start .. start + needle.len], needle)) return true;
     }
     return false;
+}
+
+test "monitor labels CAN frame format separately from identifier format" {
+    const classic_standard = Frame{
+        .timestamp_ns = 0,
+        .id = 0x123,
+        .bus = 0,
+        .len = 0,
+        .flags = .{},
+        ._pad = 0,
+        .data = @splat(0),
+    };
+    const fd_extended = Frame{
+        .timestamp_ns = 0,
+        .id = 0x800,
+        .bus = 0,
+        .len = 0,
+        .flags = .{ .fd = true, .extended = true },
+        ._pad = 0,
+        .data = @splat(0),
+    };
+
+    try std.testing.expectEqualStrings("Classic CAN", frameKindLabel(classic_standard));
+    try std.testing.expectEqualStrings("Standard ID (11-bit)", idFormatLabel(classic_standard));
+    try std.testing.expectEqualStrings("CAN FD", frameKindLabel(fd_extended));
+    try std.testing.expectEqualStrings("Extended ID (29-bit)", idFormatLabel(fd_extended));
+}
+
+test "monitor scrolls selected message and signal into view and folds its bus" {
+    const source =
+        \\VERSION ""
+        \\
+        \\NS_ :
+        \\
+        \\BS_:
+        \\
+        \\BU_: ECU
+        \\
+        \\BO_ 192 First: 8 ECU
+        \\ SG_ Value : 0|8@1+ (1,0) [0|255] "" Vector__XXX
+        \\
+        \\BO_ 193 Second: 8 ECU
+        \\ SG_ Value : 0|8@1+ (1,0) [0|255] "" Vector__XXX
+        \\
+        \\BO_ 194 Third: 8 ECU
+        \\ SG_ Value : 0|8@1+ (1,0) [0|255] "" Vector__XXX
+        \\
+        \\BO_ 195 ManySignals: 8 ECU
+        \\ SG_ S0 : 0|8@1+ (1,0) [0|255] "" Vector__XXX
+        \\ SG_ S1 : 8|8@1+ (1,0) [0|255] "" Vector__XXX
+        \\ SG_ S2 : 16|8@1+ (1,0) [0|255] "" Vector__XXX
+        \\ SG_ S3 : 24|8@1+ (1,0) [0|255] "" Vector__XXX
+        \\ SG_ S4 : 32|8@1+ (1,0) [0|255] "" Vector__XXX
+        \\ SG_ S5 : 40|8@1+ (1,0) [0|255] "V" Vector__XXX
+        \\
+    ;
+    var diagnostics: @import("../db/database.zig").Diagnostics = .empty;
+    defer diagnostics.deinit(std.testing.allocator);
+    var database = try Database.init(std.testing.allocator, .dbc, source, &diagnostics);
+    defer database.deinit();
+
+    var snapshot: store.Snapshot = .{};
+    snapshot.row_count = 5;
+    for (0..snapshot.row_count) |index| {
+        snapshot.rows[index].frame = .{
+            .timestamp_ns = if (index == 3) 12 * std.time.ns_per_s + 345 * std.time.ns_per_ms else index,
+            .id = @as(u32, 192) + @as(u32, @intCast(index)),
+            .bus = if (index == 4) 1 else 0,
+            .len = 8,
+            .flags = .{},
+            ._pad = 0,
+            .data = @splat(0),
+        };
+    }
+    @memcpy(snapshot.rows[3].frame.data[0..8], &[_]u8{ 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88 });
+    snapshot.rows[3].count = 48;
+    snapshot.rows[3].cycle_min_ns = 8_486_000;
+    snapshot.rows[3].cycle_avg_ns = 8_534_800;
+    snapshot.rows[3].cycle_max_ns = 8_660_400;
+    snapshot.rows[3].last_delta_ns = 8_800_000;
+    snapshot.rows[3].cycle_samples = 2;
+    var pins: config.PinSet = .{};
+    try pins.toggle(.{ .message = 3, .signal = 5 });
+    try pins.toggle(.{ .message = 0, .signal = 0 });
+    try pins.toggle(.{ .message = 3, .signal = null });
+    var state: State = .{ .selected_row = 3, .detail_focus = true, .selected_signal = 5 };
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    try render(std.testing.allocator, &output.writer, 120, 4, &database, &snapshot, &state, &pins);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "TYPE FMT") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "0x000000C3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "11 22 33 44 55 66 77 88") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "S5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "102.0000 V") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "S0") == null);
+
+    var stats_state: State = .{ .selected_row = 3 };
+    var stats_output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer stats_output.deinit();
+    try render(std.testing.allocator, &stats_output.writer, 120, 12, &database, &snapshot, &stats_state, &pins);
+    try std.testing.expect(std.mem.indexOf(u8, stats_output.written(), "Count") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stats_output.written(), "Cycle min") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stats_output.written(), "8.486 ms") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stats_output.written(), "Cycle avg") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stats_output.written(), "8.535 ms") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stats_output.written(), "Cycle max") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stats_output.written(), "8.660 ms") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stats_output.written(), "Last RX") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stats_output.written(), "12.345 s") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stats_output.written(), "Last delta") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stats_output.written(), "8.800 ms") != null);
+
+    var pins_output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer pins_output.deinit();
+    try renderPins(std.testing.allocator, &pins_output.writer, 160, &database, &snapshot, &pins, 0, 0, 2, 0);
+    try std.testing.expect(std.mem.indexOf(u8, pins_output.written(), "BUS") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pins_output.written(), "MESSAGE / SIGNAL") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pins_output.written(), "ManySignals.S5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pins_output.written(), "102.00") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pins_output.written(), "48") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pins_output.written(), "12.345") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pins_output.written(), "8.800") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pins_output.written(), "8.5/8.5/8.7") != null);
+
+    var horizontal_output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer horizontal_output.deinit();
+    try renderPins(std.testing.allocator, &horizontal_output.writer, 140, &database, &snapshot, &pins, 0, 0, 1, 25);
+    try std.testing.expect(std.mem.indexOf(u8, horizontal_output.written(), "48") != null);
+    try std.testing.expect(std.mem.indexOf(u8, horizontal_output.written(), "102.00") == null);
+
+    var message_output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer message_output.deinit();
+    try renderPins(std.testing.allocator, &message_output.writer, 140, &database, &snapshot, &pins, 2, 2, 1, 0);
+    try std.testing.expect(std.mem.indexOf(u8, message_output.written(), "11 22 33 44 55 66 77 88") != null);
+
+    var vertical_output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer vertical_output.deinit();
+    try renderPins(std.testing.allocator, &vertical_output.writer, 140, &database, &snapshot, &pins, 1, 1, 1, 0);
+    try std.testing.expect(std.mem.indexOf(u8, vertical_output.written(), "First.Value") != null);
+    try std.testing.expect(std.mem.indexOf(u8, vertical_output.written(), "ManySignals.S5") == null);
+
+    state.toggleSelectedBus(&snapshot, &database);
+    try std.testing.expectEqual(@as(?u8, 0), state.selected_bus_header);
+    try std.testing.expectEqual(@as(usize, 1), visibleCount(&state, &snapshot, &database));
+    try std.testing.expectEqual(@as(u32, 195), selectedFrame(&state, &snapshot, &database).?.id);
+    state.detail_focus = false;
+    state.move(1, &snapshot, &database);
+    try std.testing.expectEqual(@as(?u8, 1), state.selected_bus_header);
+    state.toggleSelectedBus(&snapshot, &database);
+    try std.testing.expect(state.collapsed_buses[1]);
+    try std.testing.expectEqual(@as(usize, 0), visibleCount(&state, &snapshot, &database));
+    state.move(-1, &snapshot, &database);
+    try std.testing.expectEqual(@as(?u8, 0), state.selected_bus_header);
+    state.toggleSelectedBus(&snapshot, &database);
+    try std.testing.expect(!state.collapsed_buses[0]);
+    try std.testing.expectEqual(@as(?u8, 0), state.selected_bus_header);
+    try std.testing.expectEqual(@as(usize, 4), visibleCount(&state, &snapshot, &database));
 }
